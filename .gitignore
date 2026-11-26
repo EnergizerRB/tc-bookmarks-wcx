@@ -1,6 +1,7 @@
-# Build artifacts (sqlite3 amalgamation is downloaded by the workflow)
+# Build artifacts (the sqlite3 amalgamation is downloaded by the workflow)
 sqlite3.c
 sqlite3.h
-sqlite3.o
+*.o
+*.wcx
 *.wcx64
 *.exe

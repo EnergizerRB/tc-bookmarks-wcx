@@ -11,14 +11,20 @@ permissions:
 
 jobs:
   build:
-    name: Build 64-bit WCX plugin
+    name: Build WCX plugin
     runs-on: windows-latest
+    env:
+      SQLITE_DEFS: >-
+        -DSQLITE_THREADSAFE=0
+        -DSQLITE_OMIT_LOAD_EXTENSION
+        -DSQLITE_OMIT_DEPRECATED
+        -DSQLITE_DEFAULT_MEMSTATUS=0
 
     steps:
       - name: Checkout sources
         uses: actions/checkout@v5
 
-      - name: Install MinGW-w64 g++ toolchain
+      - name: Install MinGW-w64 g++ toolchains
         uses: msys2/setup-msys2@v2
         with:
           # MINGW64 links against the OS msvcrt.dll, so the plugin also loads on
@@ -28,6 +34,7 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-make
+            mingw-w64-i686-gcc
           path-type: inherit
 
       - name: Download SQLite amalgamation
@@ -61,31 +68,40 @@ jobs:
       - name: Compile SQLite amalgamation
         shell: msys2 {0}
         run: |
-          gcc -c sqlite3.c -o sqlite3.o -O2 -I. \
-            -DSQLITE_THREADSAFE=0 \
-            -DSQLITE_OMIT_LOAD_EXTENSION \
-            -DSQLITE_OMIT_DEPRECATED \
-            -DSQLITE_DEFAULT_MEMSTATUS=0
+          set -e
+          gcc -c sqlite3.c -o sqlite3-x64.o -O2 -I. $SQLITE_DEFS
+          /mingw32/bin/gcc -c sqlite3.c -o sqlite3-x86.o -O2 -I. $SQLITE_DEFS
 
       - name: Compile WCX plugin
         shell: msys2 {0}
         run: |
-          g++ -std=c++17 -O2 -Wall -Wextra \
-            -DUNICODE -D_UNICODE \
-            -shared -o places_wcx.wcx64 places_wcx.cpp sqlite3.o -I. \
-            -static -static-libgcc -static-libstdc++ \
-            -Wl,--kill-at
+          set -e
+          g++ -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE \
+            -shared -o places_wcx.wcx64 places_wcx.cpp sqlite3-x64.o -I. \
+            -static -static-libgcc -static-libstdc++ -Wl,--kill-at
+          /mingw32/bin/g++ -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE \
+            -shared -o places_wcx.wcx places_wcx.cpp sqlite3-x86.o -I. \
+            -static -static-libgcc -static-libstdc++ -Wl,--kill-at
 
       - name: Verify exported WCX entry points
         shell: msys2 {0}
         run: |
-          objdump -p places_wcx.wcx64 | grep -E 'CanYouHandleThisFileW|CloseArchive|GetPackerCaps|OpenArchiveW|ProcessFileW|ReadHeaderExW|SetChangeVolProcW|SetProcessDataProcW'
-          test -f places_wcx.wcx64
-          ls -l places_wcx.wcx64
+          set -e
+          for pair in "places_wcx.wcx64:objdump" "places_wcx.wcx:/mingw32/bin/objdump"; do
+            file="${pair%%:*}"
+            tool="${pair##*:}"
+            echo "== $file =="
+            test -f "$file"
+            $tool -p "$file" | grep -E 'CanYouHandleThisFileW|CloseArchive|GetPackerCaps|OpenArchiveW|ProcessFileW|ReadHeaderExW|SetChangeVolProcW|SetProcessDataProcW'
+            $tool -p "$file" | grep 'DLL Name'
+            ls -l "$file"
+          done
 
-      - name: Upload plugin artifact
-        uses: actions/upload-artifact@v6
+      - name: Upload plugin artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: places_wcx.wcx64
-          path: places_wcx.wcx64
+          name: places_wcx
+          path: |
+            places_wcx.wcx64
+            places_wcx.wcx
           if-no-files-found: error
