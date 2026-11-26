@@ -21,11 +21,13 @@ jobs:
       - name: Install MinGW-w64 g++ toolchain
         uses: msys2/setup-msys2@v2
         with:
-          msystem: UCRT64
+          # MINGW64 links against the OS msvcrt.dll, so the plugin also loads on
+          # Windows versions without the Universal CRT (UCRT64 would require it).
+          msystem: MINGW64
           update: true
           install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-make
           path-type: inherit
 
       - name: Download SQLite amalgamation
@@ -82,7 +84,7 @@ jobs:
           ls -l places_wcx.wcx64
 
       - name: Upload plugin artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: places_wcx.wcx64
           path: places_wcx.wcx64
