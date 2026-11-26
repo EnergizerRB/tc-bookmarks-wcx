@@ -1,9 +1,0 @@
-```def
-EXPORTS
-    OpenArchiveW
-    ReadHeaderExW
-    ProcessFileW
-    CloseArchive
-    GetPackerCaps
-    SetChangeVolProcW
-    SetProcessDataProcW
