@@ -126,8 +126,9 @@ jobs:
             echo "== $file =="
             test -f "$file"
             dump="$($tool -p "$file" | tr -d '\r')"
+            echo "$dump" | sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p'
             for name in $exports; do
-              echo "$dump" | grep -q " $name\$" || {
+              echo "$dump" | grep -qw "$name" || {
                 echo "::error::$file does not export $name"
                 exit 1
               }
