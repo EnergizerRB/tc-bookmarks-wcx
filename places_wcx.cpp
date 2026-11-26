@@ -19,6 +19,7 @@
 #include <windows.h>
 
 #include <cstddef>
+#include <cstdio>
 #include <map>
 #include <new>
 #include <set>
@@ -318,6 +319,47 @@ sqlite3* OpenReadOnlyUri(const std::wstring& path, OpenAttempt& attempt) {
   return db;
 }
 
+std::wstring TempDirectory() {
+  wchar_t tmp[MAX_PATH + 1] = {0};
+  const DWORD len = GetTempPathW(MAX_PATH, tmp);
+  if (len == 0 || len > MAX_PATH) return std::wstring();
+  return std::wstring(tmp, len);
+}
+
+// A plain log next to the %TEMP% folder: when Total Commander refuses to show a
+// file from the archive, this still records what the plugin was asked to do.
+void AppendLog(const std::string& line) {
+  const std::wstring dir = TempDirectory();
+  if (dir.empty()) return;
+  const std::wstring path = dir + L"places_wcx.log";
+  HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return;
+
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  char stamp[32] = {0};
+  std::snprintf(stamp, sizeof(stamp), "%02u:%02u:%02u.%03u ", st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds);
+  const std::string text = std::string(stamp) + line + "\r\n";
+  DWORD written = 0;
+  WriteFile(file, text.data(), (DWORD)text.size(), &written, nullptr);
+  CloseHandle(file);
+}
+
+void WriteReportFile(const std::string& text) {
+  const std::wstring dir = TempDirectory();
+  if (dir.empty()) return;
+  const std::wstring path = dir + L"places_wcx_debug.txt";
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return;
+  DWORD written = 0;
+  WriteFile(file, text.data(), (DWORD)text.size(), &written, nullptr);
+  CloseHandle(file);
+}
+
 std::wstring WindowsTempDirectory() {
   wchar_t win[MAX_PATH + 1] = {0};
   const UINT len = GetWindowsDirectoryW(win, MAX_PATH);
@@ -393,6 +435,7 @@ struct ArchiveHandle {
   std::vector<Entry> entries;
   std::wstring archiveName;  // source database path, reported back as ArcName
   size_t index = 0;
+  size_t lastIndex = 0;  // entry returned by the previous ReadHeaderExW
   tChangeVolProcW changeVol = nullptr;
   tProcessDataProcW processData = nullptr;
 };
@@ -791,6 +834,7 @@ WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
   if (!FileName || !*FileName) return nullptr;
 
   const std::wstring src(FileName);
+  AppendLog("OpenArchiveW '" + WideToUtf8(src) + "'");
   std::vector<OpenAttempt> attempts;
   std::vector<Entry> entries;
   int bookmarkRows = 0;
@@ -807,6 +851,10 @@ WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
     built = BuildEntries(db, entries, &bookmarkRows, error, &readError);
     sqlite3_close(db);
   }
+  AppendLog("  direct rc=" + std::to_string(direct.rc) +
+            (direct.error.empty() ? "" : " " + direct.error) +
+            " rows=" + std::to_string(bookmarkRows) +
+            (error.empty() ? "" : " reason=" + error));
 
   // Copies are only worth trying when the database could not be read in place.
   if (!built && (!directOpened || readError)) {
@@ -816,6 +864,8 @@ WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
     for (const std::wstring& folder : folders) {
       OpenAttempt attempt;
       sqlite3* copy = OpenCopiedDatabase(src, folder, workspace, attempt);
+      AppendLog("  copy in '" + WideToUtf8(attempt.target) + "' rc=" +
+                std::to_string(attempt.rc) + (attempt.error.empty() ? "" : " " + attempt.error));
       attempts.push_back(attempt);
       if (!copy) continue;
       built = BuildEntries(copy, entries, &bookmarkRows, error, &readError);
@@ -827,14 +877,17 @@ WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
 
   if (!built) {
     // An empty panel would hide the cause, so the archive always carries a file
-    // that explains what happened; F3 on it shows the report.
+    // that explains what happened; F3 on it shows the report.  The same text is
+    // written to %TEMP%\places_wcx_debug.txt for when the viewer cannot open it.
     entries.clear();
     Entry debug;
     debug.path = L"DEBUG_INFO.txt";
     debug.content = BuildDebugReport(src, attempts, bookmarkRows, error);
     debug.dosTime = CurrentDosTime();
     entries.push_back(debug);
+    WriteReportFile(debug.content);
   }
+  AppendLog("  -> " + std::to_string(entries.size()) + " entries");
 
   ArchiveHandle* handle = new (std::nothrow) ArchiveHandle();
   if (!handle) return nullptr;
@@ -849,6 +902,7 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
   if (handle->index >= handle->entries.size()) return E_END_ARCHIVE;
 
   const Entry& entry = handle->entries[handle->index++];
+  handle->lastIndex = handle->index - 1;
   ZeroMemory(HeaderData, sizeof(*HeaderData));
   lstrcpynW(HeaderData->ArcName, handle->archiveName.c_str(), 1024);
   lstrcpynW(HeaderData->FileName, entry.path.c_str(), 1024);
@@ -872,36 +926,74 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
   return E_SUCCESS;
 }
 
-WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
-                                      LPWSTR DestPath, LPWSTR DestName) {
-  ArchiveHandle* handle = reinterpret_cast<ArchiveHandle*>(hArcData);
+std::wstring LastComponent(const std::wstring& path) {
+  const size_t slash = path.find_last_of(L"\\/");
+  return (slash == std::wstring::npos) ? path : path.substr(slash + 1);
+}
+
+bool IsAbsolutePath(const std::wstring& path) {
+  if (path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) {
+    return true;
+  }
+  return path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\';
+}
+
+// A path that already names the destination file rather than a folder.
+bool LooksLikeFilePath(const std::wstring& path) {
+  if (path.empty() || path.back() == L'\\' || path.back() == L'/') return false;
+  const std::wstring name = LastComponent(path);
+  const size_t dot = name.find_last_of(L'.');
+  return dot != std::wstring::npos && dot > 0;
+}
+
+int ExtractEntry(ArchiveHandle* handle, int Operation, LPWSTR DestPath,
+                 LPWSTR DestName) {
   if (!handle) return E_BAD_ARCHIVE;
-  if (Operation == PK_SKIP || Operation == PK_TEST) return E_SUCCESS;
   if (Operation != PK_EXTRACT) return E_NOT_SUPPORTED;
 
-  const Entry* entry = FindEntry(handle, DestName);
+  const std::wstring destPath = DestPath ? DestPath : L"";
+  const std::wstring destName = DestName ? DestName : L"";
+
+  const Entry* entry = nullptr;
+  if (!destName.empty()) {
+    entry = FindEntry(handle, destName.c_str());
+    if (!entry && IsAbsolutePath(destName)) {
+      entry = FindEntry(handle, LastComponent(destName).c_str());
+    }
+  }
+  if (!entry && handle->lastIndex < handle->entries.size()) {
+    // Total Commander may extract the entry it listed last without naming it.
+    entry = &handle->entries[handle->lastIndex];
+  }
+  if (!entry && handle->entries.size() == 1) entry = &handle->entries[0];
   if (!entry) return E_BAD_ARCHIVE;
 
   std::wstring target;
-  if (DestPath && *DestPath) {
-    target = DestPath;
-    if (target.back() != L'\\' && target.back() != L'/') target += L'\\';
+  if (!destPath.empty() && LooksLikeFilePath(destPath)) {
+    target = destPath;  // Total Commander already named the output file
+  } else if (IsAbsolutePath(destName)) {
+    target = destName;
+  } else {
+    target = destPath.empty() ? TempDirectory() : destPath;
+    if (!target.empty() && target.back() != L'\\' && target.back() != L'/') {
+      target += L'\\';
+    }
+    const wchar_t* relative = destName.empty() ? entry->path.c_str() : destName.c_str();
+    while (*relative == L'\\' || *relative == L'/') ++relative;
+    target += relative;
   }
-  const wchar_t* relative = (DestName && *DestName) ? DestName : entry->path.c_str();
-  while (*relative == L'\\' || *relative == L'/') ++relative;
-  target += relative;
 
-  // Total Commander hands over the whole relative path, so the folders that the
-  // listing only implies have to be created here.
+  // The listing implies folders without listing them, so create them here.
   CreateParentDirectories(target);
 
-  HANDLE file = CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+  HANDLE file = CreateFileW(target.c_str(), GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
                             FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE) return E_ECREATE;
 
   DWORD written = 0;
-  const BOOL ok = WriteFile(file, entry->content.data(),
-                            (DWORD)entry->content.size(), &written, nullptr);
+  const BOOL ok = WriteFile(file, entry->content.data(), (DWORD)entry->content.size(),
+                            &written, nullptr);
   CloseHandle(file);
   if (!ok || written != entry->content.size()) return E_EWRITE;
 
@@ -910,6 +1002,18 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
                         (int)entry->content.size());
   }
   return E_SUCCESS;
+}
+
+WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
+                                      LPWSTR DestPath, LPWSTR DestName) {
+  if (Operation == PK_SKIP || Operation == PK_TEST) return E_SUCCESS;
+  const int rc = ExtractEntry(reinterpret_cast<ArchiveHandle*>(hArcData), Operation,
+                              DestPath, DestName);
+  AppendLog("ProcessFileW op=" + std::to_string(Operation) + " destPath='" +
+            (DestPath ? WideToUtf8(DestPath) : std::string("<null>")) + "' destName='" +
+            (DestName ? WideToUtf8(DestName) : std::string("<null>")) +
+            "' rc=" + std::to_string(rc));
+  return rc;
 }
 
 WCX_EXPORT void __stdcall CloseArchive(HANDLE hArcData) {
