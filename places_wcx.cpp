@@ -18,6 +18,7 @@
 
 #include <windows.h>
 
+#include <cstddef>
 #include <map>
 #include <new>
 #include <set>
@@ -46,14 +47,17 @@
 typedef int(__stdcall* tChangeVolProcW)(LPWSTR ArcName, int Mode);
 typedef int(__stdcall* tProcessDataProcW)(LPWSTR FileName, int Size);
 
+// Layout copied verbatim from the Total Commander wcxhead.h: natural compiler
+// alignment, no #pragma pack.  Packing the structure shifts the pointer and the
+// size fields, and Total Commander then reads an empty FileName.
 struct tHeaderDataExW {
   WCHAR ArcName[1024];
   WCHAR FileName[1024];
   int Flags;
-  DWORD PackSizeHigh;
   DWORD PackSize;
-  DWORD UnpSizeHigh;
+  DWORD PackSizeHigh;
   DWORD UnpSize;
+  DWORD UnpSizeHigh;
   int HostOS;
   int FileCRC;
   int FileTime;
@@ -64,8 +68,37 @@ struct tHeaderDataExW {
   int CmtBufSize;
   int CmtSize;
   int CmtState;
-  int Reserved[1024];
+  char Reserved[1024];
 };
+
+static_assert(offsetof(tHeaderDataExW, ArcName) == 0, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, FileName) == 2048, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, Flags) == 4096, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, PackSize) == 4100, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, PackSizeHigh) == 4104, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, UnpSize) == 4108, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, UnpSizeHigh) == 4112, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, HostOS) == 4116, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, FileCRC) == 4120, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, FileTime) == 4124, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, UnpVer) == 4128, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, Method) == 4132, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, FileAttr) == 4136, "wcxhead.h layout");
+#if defined(_WIN64)
+static_assert(offsetof(tHeaderDataExW, CmtBuf) == 4144, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtBufSize) == 4152, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtSize) == 4156, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtState) == 4160, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, Reserved) == 4164, "wcxhead.h layout");
+static_assert(sizeof(tHeaderDataExW) == 5192, "wcxhead.h layout");
+#else
+static_assert(offsetof(tHeaderDataExW, CmtBuf) == 4140, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtBufSize) == 4144, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtSize) == 4148, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, CmtState) == 4152, "wcxhead.h layout");
+static_assert(offsetof(tHeaderDataExW, Reserved) == 4156, "wcxhead.h layout");
+static_assert(sizeof(tHeaderDataExW) == 5180, "wcxhead.h layout");
+#endif
 
 #define WCX_EXPORT extern "C" __declspec(dllexport)
 
@@ -202,13 +235,20 @@ class TempWorkspace {
     wchar_t tmp[MAX_PATH + 1] = {0};
     DWORD len = GetTempPathW(MAX_PATH, tmp);
     if (len == 0 || len > MAX_PATH) return false;
-    std::wstring dir = std::wstring(tmp) + L"places_wcx_" +
-                       std::to_wstring(GetCurrentProcessId()) + L"_" +
-                       std::to_wstring((unsigned long long)GetTickCount64());
+    return CreateIn(std::wstring(tmp, len));
+  }
+
+  bool CreateIn(const std::wstring& base) {
+    if (base.empty()) return false;
+    std::wstring dir = base;
+    if (dir.back() != L'\\' && dir.back() != L'/') dir += L'\\';
+    dir += L"places_wcx_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+           std::to_wstring((unsigned long long)GetTickCount64());
     if (!CreateDirectoryW(dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) {
       return false;
     }
     dir_ = dir;
+    dirs_.push_back(dir);
     return true;
   }
 
@@ -227,15 +267,117 @@ class TempWorkspace {
   void Cleanup() {
     for (const std::wstring& f : files_) DeleteFileW(f.c_str());
     files_.clear();
-    if (!dir_.empty()) {
-      RemoveDirectoryW(dir_.c_str());
-      dir_.clear();
-    }
+    for (const std::wstring& d : dirs_) RemoveDirectoryW(d.c_str());
+    dirs_.clear();
+    dir_.clear();
   }
 
   std::wstring dir_;
   std::vector<std::wstring> files_;
+  std::vector<std::wstring> dirs_;
 };
+
+struct OpenAttempt {
+  std::wstring target;  // what was opened, or the folder used for the copy
+  int rc = SQLITE_OK;   // sqlite3_open_v2 result
+  std::string error;    // sqlite3_errmsg of the failed call
+  bool opened = false;
+};
+
+std::string EncodeUriPath(const std::wstring& path) {
+  const std::string utf8 = WideToUtf8(path);
+  const bool unc = utf8.size() >= 2 && utf8[0] == '\\' && utf8[1] == '\\';
+  std::string uri = unc ? "file:" : "file:///";
+  for (char c : utf8) {
+    switch (c) {
+      case '\\': uri.push_back('/'); break;
+      case ' ': uri.append("%20"); break;
+      case '%': uri.append("%25"); break;
+      case '#': uri.append("%23"); break;
+      case '?': uri.append("%3F"); break;
+      default: uri.push_back(c); break;
+    }
+  }
+  uri.append("?mode=ro&nolock=1");
+  return uri;
+}
+
+// Opens the database where it lives: no copy, no locking, read-only.
+sqlite3* OpenReadOnlyUri(const std::wstring& path, OpenAttempt& attempt) {
+  attempt.target = path;
+  const std::string uri = EncodeUriPath(path);
+  sqlite3* db = nullptr;
+  attempt.rc =
+      sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
+  if (attempt.rc != SQLITE_OK) {
+    attempt.error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
+    if (db) sqlite3_close(db);
+    return nullptr;
+  }
+  attempt.opened = true;
+  return db;
+}
+
+std::wstring WindowsTempDirectory() {
+  wchar_t win[MAX_PATH + 1] = {0};
+  const UINT len = GetWindowsDirectoryW(win, MAX_PATH);
+  if (len == 0 || len >= MAX_PATH) return std::wstring();
+  return std::wstring(win, len) + L"\\Temp";
+}
+
+std::wstring ModuleDirectory() {
+  HMODULE module = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(&ModuleDirectory), &module)) {
+    return std::wstring();
+  }
+  wchar_t path[MAX_PATH * 2] = {0};
+  const DWORD len = GetModuleFileNameW(module, path, (DWORD)(sizeof(path) / sizeof(path[0])));
+  if (len == 0 || len >= sizeof(path) / sizeof(path[0])) return std::wstring();
+  const std::wstring full(path, len);
+  const size_t slash = full.find_last_of(L"\\/");
+  return (slash == std::wstring::npos) ? std::wstring() : full.substr(0, slash);
+}
+
+// Fallback: work on a copy when the original cannot be read in place, for
+// example while Firefox keeps the database open.
+sqlite3* OpenCopiedDatabase(const std::wstring& src, const std::wstring& baseDir,
+                            TempWorkspace& workspace, OpenAttempt& attempt) {
+  attempt.target = baseDir.empty() ? L"%TEMP%" : baseDir;
+  const bool created = baseDir.empty() ? workspace.Create() : workspace.CreateIn(baseDir);
+  if (!created) {
+    attempt.rc = SQLITE_CANTOPEN;
+    attempt.error = "cannot create a temporary folder";
+    return nullptr;
+  }
+  const std::wstring copy = workspace.CopyIn(src, L"tc_places_tmp.sqlite");
+  if (copy.empty()) {
+    attempt.rc = SQLITE_CANTOPEN;
+    attempt.error = "cannot copy the database";
+    return nullptr;
+  }
+  workspace.CopyIn(src + L"-wal", L"tc_places_tmp.sqlite-wal");
+  workspace.CopyIn(src + L"-shm", L"tc_places_tmp.sqlite-shm");
+  attempt.target = copy;
+
+  sqlite3* db = OpenReadOnlyUri(copy, attempt);
+  if (db) return db;
+
+  // Replaying a WAL needs write access to the shm file; the copy is ours alone.
+  const std::string path8 = WideToUtf8(copy);
+  attempt.rc = sqlite3_open_v2(path8.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr);
+  if (attempt.rc != SQLITE_OK) {
+    if (db) {
+      attempt.error = sqlite3_errmsg(db);
+      sqlite3_close(db);
+    }
+    return nullptr;
+  }
+  attempt.opened = true;
+  attempt.error.clear();
+  return db;
+}
 
 // ---------------------------------------------------------------------------
 // Archive model
@@ -347,7 +489,21 @@ std::map<std::string, sqlite3_int64> FindRootIds(sqlite3* db) {
   return ids;
 }
 
-bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
+int CountRows(sqlite3* db, const char* sql) {
+  sqlite3_stmt* st = nullptr;
+  int count = -1;
+  if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    return count;
+  }
+  if (sqlite3_step(st) == SQLITE_ROW) count = sqlite3_column_int(st, 0);
+  sqlite3_finalize(st);
+  return count;
+}
+
+bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
+                  std::string& error, bool* readError) {
+  if (readError) *readError = false;
   static const char* kSqlWithOrder =
       "SELECT b.id, b.parent, b.type, b.title, p.url, b.dateAdded "
       "FROM moz_bookmarks b LEFT JOIN moz_places p ON p.id = b.fk "
@@ -356,19 +512,24 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
       "SELECT b.id, b.parent, b.type, b.title, p.url, 0 "
       "FROM moz_bookmarks b LEFT JOIN moz_places p ON p.id = b.fk";
 
+  if (bookmarkRows) *bookmarkRows = CountRows(db, "SELECT count(*) FROM moz_bookmarks");
+
   sqlite3_stmt* st = nullptr;
   if (sqlite3_prepare_v2(db, kSqlWithOrder, -1, &st, nullptr) != SQLITE_OK) {
     if (st) sqlite3_finalize(st);
     st = nullptr;
     if (sqlite3_prepare_v2(db, kSqlPlain, -1, &st, nullptr) != SQLITE_OK) {
       if (st) sqlite3_finalize(st);
+      error = std::string("cannot read moz_bookmarks: ") + sqlite3_errmsg(db);
+      if (readError) *readError = true;
       return false;
     }
   }
 
   std::map<sqlite3_int64, Node> nodes;
   std::map<sqlite3_int64, std::vector<sqlite3_int64> > children;
-  while (sqlite3_step(st) == SQLITE_ROW) {
+  int step = SQLITE_ROW;
+  while ((step = sqlite3_step(st)) == SQLITE_ROW) {
     Node node;
     node.id = sqlite3_column_int64(st, 0);
     node.parent = sqlite3_column_int64(st, 1);
@@ -381,8 +542,16 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
     children[node.parent].push_back(node.id);
   }
   sqlite3_finalize(st);
+  if (step != SQLITE_DONE) {
+    error = std::string("reading moz_bookmarks failed: ") + sqlite3_errmsg(db);
+    if (readError) *readError = true;
+    return false;
+  }
 
-  if (nodes.empty()) return false;
+  if (nodes.empty()) {
+    error = "moz_bookmarks holds no bookmark or folder rows";
+    return false;
+  }
 
   const std::map<std::string, sqlite3_int64> rootIds = FindRootIds(db);
   for (const RootFolder& root : kRootFolders) {
@@ -402,7 +571,12 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
       EmitTree(nodes, children, it->first, base + L"\\", out, 0);
     }
   }
-  return !out.empty();
+
+  if (out.empty()) {
+    error = "the menu/toolbar/unfiled/mobile folders contain no bookmarks";
+    return false;
+  }
+  return true;
 }
 
 bool HasMozBookmarks(const std::wstring& path) {
@@ -516,10 +690,10 @@ struct tHeaderDataExA {
   char ArcName[1024];
   char FileName[1024];
   int Flags;
-  DWORD PackSizeHigh;
   DWORD PackSize;
-  DWORD UnpSizeHigh;
+  DWORD PackSizeHigh;
   DWORD UnpSize;
+  DWORD UnpSizeHigh;
   int HostOS;
   int FileCRC;
   int FileTime;
@@ -530,7 +704,7 @@ struct tHeaderDataExA {
   int CmtBufSize;
   int CmtSize;
   int CmtState;
-  int Reserved[1024];
+  char Reserved[1024];
 };
 
 WCX_EXPORT HANDLE __stdcall OpenArchive(LPSTR FileName, int Mode) {
@@ -578,41 +752,89 @@ WCX_EXPORT BOOL __stdcall CanYouHandleThisFile(LPSTR FileName) {
   return FALSE;
 }
 
+std::string BuildDebugReport(const std::wstring& arcName,
+                             const std::vector<OpenAttempt>& attempts,
+                             int bookmarkRows, const std::string& error) {
+  // UTF-8 BOM: the report may contain Cyrillic paths and Total Commander's
+  // lister only switches to UTF-8 when it sees one.
+  std::string out = "\xEF\xBB\xBF";
+  out += "places_wcx could not read any bookmark from this database.\r\n";
+  out += "===========================================================\r\n\r\n";
+  out += "Archive name (as passed by Total Commander):\r\n  " + WideToUtf8(arcName) +
+         "\r\n\r\n";
+#if defined(_WIN64)
+  out += "Plugin build           : x64\r\n";
+#else
+  out += "Plugin build           : x86\r\n";
+#endif
+  out += "sizeof(tHeaderDataExW) : " + std::to_string(sizeof(tHeaderDataExW)) + "\r\n";
+  out += "moz_bookmarks rows     : " + std::to_string(bookmarkRows) + "\r\n";
+  if (!error.empty()) out += "Reason                 : " + error + "\r\n";
+
+  out += "\r\nAttempts to open the database:\r\n";
+  for (size_t i = 0; i < attempts.size(); ++i) {
+    const OpenAttempt& a = attempts[i];
+    out += "  " + std::to_string(i + 1) + ") " + WideToUtf8(a.target) + "\r\n";
+    out += "     sqlite3_open_v2 = " + std::to_string(a.rc);
+    out += a.opened ? " (opened)\r\n" : " (failed)\r\n";
+    if (!a.error.empty()) out += "     sqlite3_errmsg  = " + a.error + "\r\n";
+  }
+
+  out +=
+      "\r\nA row count of 0 means the file is not a Firefox places database or\r\n"
+      "the profile never stored bookmarks.\r\n";
+  return out;
+}
+
 WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
   (void)Mode;
   if (!FileName || !*FileName) return nullptr;
 
   const std::wstring src(FileName);
-  TempWorkspace workspace;
-  if (!workspace.Create()) return nullptr;
+  std::vector<OpenAttempt> attempts;
+  std::vector<Entry> entries;
+  int bookmarkRows = 0;
+  std::string error;
+  TempWorkspace workspace;  // removes the fallback copies when it goes away
+  bool built = false;
+  bool readError = false;
 
-  std::wstring dbPath = workspace.CopyIn(src, L"places.sqlite");
-  if (dbPath.empty()) return nullptr;
-  // The journals belong to the copied database, not to the original one.
-  workspace.CopyIn(src + L"-wal", L"places.sqlite-wal");
-  workspace.CopyIn(src + L"-shm", L"places.sqlite-shm");
+  OpenAttempt direct;
+  sqlite3* db = OpenReadOnlyUri(src, direct);
+  attempts.push_back(direct);
+  const bool directOpened = db != nullptr;
+  if (db) {
+    built = BuildEntries(db, entries, &bookmarkRows, error, &readError);
+    sqlite3_close(db);
+  }
 
-  const std::string dbUtf8 = WideToUtf8(dbPath);
-  sqlite3* db = nullptr;
-  if (sqlite3_open_v2(dbUtf8.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
-    if (db) {
-      sqlite3_close(db);
-      db = nullptr;
-    }
-    // A WAL database may need write access to its shm file; the workspace copy
-    // is ours alone, so falling back to read/write keeps the original intact.
-    if (sqlite3_open_v2(dbUtf8.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) !=
-        SQLITE_OK) {
-      if (db) sqlite3_close(db);
-      return nullptr;
+  // Copies are only worth trying when the database could not be read in place.
+  if (!built && (!directOpened || readError)) {
+    entries.clear();
+    const std::wstring folders[] = {WindowsTempDirectory(), ModuleDirectory(),
+                                    std::wstring()};
+    for (const std::wstring& folder : folders) {
+      OpenAttempt attempt;
+      sqlite3* copy = OpenCopiedDatabase(src, folder, workspace, attempt);
+      attempts.push_back(attempt);
+      if (!copy) continue;
+      built = BuildEntries(copy, entries, &bookmarkRows, error, &readError);
+      sqlite3_close(copy);
+      if (built) break;
+      entries.clear();
     }
   }
-  sqlite3_busy_timeout(db, 2000);
 
-  std::vector<Entry> entries;
-  const bool built = BuildEntries(db, entries);
-  sqlite3_close(db);
-  if (!built) return nullptr;
+  if (!built) {
+    // An empty panel would hide the cause, so the archive always carries a file
+    // that explains what happened; F3 on it shows the report.
+    entries.clear();
+    Entry debug;
+    debug.path = L"DEBUG_INFO.txt";
+    debug.content = BuildDebugReport(src, attempts, bookmarkRows, error);
+    debug.dosTime = CurrentDosTime();
+    entries.push_back(debug);
+  }
 
   ArchiveHandle* handle = new (std::nothrow) ArchiveHandle();
   if (!handle) return nullptr;
