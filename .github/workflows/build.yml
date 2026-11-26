@@ -1,0 +1,22 @@
+name: Build Total Commander WCX Plugin
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build 64-bit plugin (bookmarks.wcx64)
+        run: |
+          g++ -shared -O2 -static -o bookmarks.wcx64 bookmarks_wcx.cpp bookmarks_wcx.def
+
+      - name: Upload WCX Plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: bookmarks-tc-plugin
+          path: bookmarks.wcx64
+          
