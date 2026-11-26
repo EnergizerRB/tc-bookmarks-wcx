@@ -76,6 +76,7 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
+          exec 2>&1
           echo "== x86_64 =="
           gcc -c sqlite3.c -o sqlite3-x64.o -O2 -I. $SQLITE_DEFS
           echo "== i686 =="
