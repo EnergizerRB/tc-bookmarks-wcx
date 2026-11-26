@@ -111,11 +111,6 @@ jobs:
         run: |
           set -e
           exec 2>&1
-          exports="OpenArchive OpenArchiveW ReadHeader ReadHeaderEx ReadHeaderExW
-                   ProcessFile ProcessFileW CloseArchive GetPackerCaps
-                   CanYouHandleThisFile CanYouHandleThisFileW
-                   SetChangeVolProc SetChangeVolProcW
-                   SetProcessDataProc SetProcessDataProcW"
           for pair in "places_wcx.wcx64:objdump" "places_wcx.wcx:mingw32-objdump"; do
             file="${pair%%:*}"
             tool="${pair##*:}"
@@ -126,24 +121,28 @@ jobs:
             echo "== $file =="
             test -f "$file"
             dump="$($tool -p "$file" | tr -d '\r')"
-            echo "$dump" | sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p'
-            for name in $exports; do
-              echo "$dump" | grep -qw "$name" || {
-                echo "::error::$file does not export $name"
-                exit 1
-              }
-            done
-            echo "all 15 entry points exported"
-            for dll in $(echo "$dump" | grep 'DLL Name' | awk '{print $3}'); do
-              case "$(echo "$dll" | tr 'A-Z' 'a-z')" in
-                kernel32.dll|msvcrt.dll|ucrtbase.dll|user32.dll|advapi32.dll|api-ms-win-crt-*) ;;
-                *)
-                  echo "::error::$file imports $dll"
-                  exit 1
-                  ;;
-              esac
-            done
-            echo "$dump" | grep 'DLL Name'
+
+            exported=$(sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' <<<"$dump" |
+                       sed '1,2d' | awk 'NF {print $NF}' | sort)
+            expected=$(sed -e 's/;.*//' places_wcx.def |
+                       awk 'NF && $1 != "EXPORTS" {print $1}' | sort)
+            echo "exported: $(echo $exported)"
+            if [ "$exported" != "$expected" ]; then
+              echo "::error::$file export table differs from places_wcx.def"
+              diff <(echo "$expected") <(echo "$exported") || true
+              exit 1
+            fi
+            echo "$file exports all $(echo "$expected" | wc -l) entry points"
+
+            imports=$(awk '/DLL Name/ {print $3}' <<<"$dump")
+            echo "imports: $(echo $imports)"
+            bad=$(awk '/DLL Name/ {n = tolower($3)
+                        if (n !~ /^(kernel32|msvcrt|ucrtbase|user32|advapi32)\.dll$/ &&
+                            n !~ /^api-ms-win-crt-/) print n}' <<<"$dump")
+            if [ -n "$bad" ]; then
+              echo "::error::$file imports non-system libraries: $bad"
+              exit 1
+            fi
             ls -l "$file"
           done
 
