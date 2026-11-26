@@ -34,8 +34,15 @@ jobs:
           install: >-
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-make
-            mingw-w64-i686-gcc
           path-type: inherit
+
+      - name: Install 32-bit MinGW-w64 toolchain
+        shell: msys2 {0}
+        run: |
+          set -e
+          pacman -S --noconfirm --needed mingw-w64-i686-gcc
+          /mingw32/bin/gcc --version | head -1
+          /mingw32/bin/g++ --version | head -1
 
       - name: Download SQLite amalgamation
         shell: pwsh
@@ -69,19 +76,25 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
+          echo "== x86_64 =="
           gcc -c sqlite3.c -o sqlite3-x64.o -O2 -I. $SQLITE_DEFS
+          echo "== i686 =="
           /mingw32/bin/gcc -c sqlite3.c -o sqlite3-x86.o -O2 -I. $SQLITE_DEFS
+          ls -l sqlite3-x64.o sqlite3-x86.o
 
       - name: Compile WCX plugin
         shell: msys2 {0}
         run: |
           set -e
+          echo "== x86_64 =="
           g++ -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE \
             -shared -o places_wcx.wcx64 places_wcx.cpp sqlite3-x64.o -I. \
             -static -static-libgcc -static-libstdc++ -Wl,--kill-at
+          echo "== i686 =="
           /mingw32/bin/g++ -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE \
             -shared -o places_wcx.wcx places_wcx.cpp sqlite3-x86.o -I. \
             -static -static-libgcc -static-libstdc++ -Wl,--kill-at
+          ls -l places_wcx.wcx64 places_wcx.wcx
 
       - name: Verify exported WCX entry points
         shell: msys2 {0}
