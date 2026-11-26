@@ -36,10 +36,14 @@
 #define PK_TEST 1
 #define PK_EXTRACT 2
 
+#define PK_OM_LIST 0
+#define PK_OM_EXTRACT 1
+
 #define PK_CAPS_BY_CONTENT 64
 
 #define E_SUCCESS 0
 #define E_END_ARCHIVE 10
+#define E_EOPEN 15
 #define E_BAD_ARCHIVE 13
 #define E_ECREATE 16
 #define E_EWRITE 19
@@ -101,6 +105,48 @@ static_assert(offsetof(tHeaderDataExW, Reserved) == 4156, "wcxhead.h layout");
 static_assert(sizeof(tHeaderDataExW) == 5180, "wcxhead.h layout");
 #endif
 
+// OpenArchive and OpenArchiveW do not receive a plain file name but this
+// structure; the first member is a pointer to the archive path.
+struct tOpenArchiveDataW {
+  WCHAR* ArcName;
+  int OpenMode;
+  int OpenResult;
+  WCHAR* CmtBuf;
+  int CmtBufSize;
+  int CmtSize;
+  int CmtState;
+};
+
+struct tOpenArchiveDataA {
+  char* ArcName;
+  int OpenMode;
+  int OpenResult;
+  char* CmtBuf;
+  int CmtBufSize;
+  int CmtSize;
+  int CmtState;
+};
+
+#if defined(_WIN64)
+static_assert(offsetof(tOpenArchiveDataW, OpenMode) == 8, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, OpenResult) == 12, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtBuf) == 16, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtBufSize) == 24, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtSize) == 28, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtState) == 32, "wcxhead.h layout");
+static_assert(sizeof(tOpenArchiveDataW) == 40, "wcxhead.h layout");
+static_assert(sizeof(tOpenArchiveDataA) == 40, "wcxhead.h layout");
+#else
+static_assert(offsetof(tOpenArchiveDataW, OpenMode) == 4, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, OpenResult) == 8, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtBuf) == 12, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtBufSize) == 16, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtSize) == 20, "wcxhead.h layout");
+static_assert(offsetof(tOpenArchiveDataW, CmtState) == 24, "wcxhead.h layout");
+static_assert(sizeof(tOpenArchiveDataW) == 28, "wcxhead.h layout");
+static_assert(sizeof(tOpenArchiveDataA) == 28, "wcxhead.h layout");
+#endif
+
 #define WCX_EXPORT extern "C" __declspec(dllexport)
 
 namespace {
@@ -143,6 +189,16 @@ std::wstring Utf8ToWide(const char* s, int len) {
   if (wlen <= 0) return std::wstring();
   std::wstring out((size_t)wlen, L'\0');
   MultiByteToWideChar(CP_UTF8, 0, s, len, &out[0], wlen);
+  return out;
+}
+
+std::wstring AnsiToWide(const char* s) {
+  if (!s || !*s) return std::wstring();
+  const int len = (int)strlen(s);
+  int wlen = MultiByteToWideChar(CP_ACP, 0, s, len, nullptr, 0);
+  if (wlen <= 0) return std::wstring();
+  std::wstring out((size_t)wlen, L'\0');
+  MultiByteToWideChar(CP_ACP, 0, s, len, &out[0], wlen);
   return out;
 }
 
@@ -750,10 +806,21 @@ struct tHeaderDataExA {
   char Reserved[1024];
 };
 
-WCX_EXPORT HANDLE __stdcall OpenArchive(LPSTR FileName, int Mode) {
-  (void)FileName;
-  (void)Mode;
-  return nullptr;
+HANDLE OpenArchivePath(const std::wstring& src, int mode, int* result);
+
+WCX_EXPORT HANDLE __stdcall OpenArchive(tOpenArchiveDataA* ArchiveData) {
+  if (!ArchiveData) return nullptr;
+  ArchiveData->CmtSize = 0;
+  ArchiveData->CmtState = 0;
+  if (!ArchiveData->ArcName || !*ArchiveData->ArcName) {
+    ArchiveData->OpenResult = E_EOPEN;
+    return nullptr;
+  }
+  int result = E_SUCCESS;
+  HANDLE handle = OpenArchivePath(AnsiToWide(ArchiveData->ArcName),
+                                  ArchiveData->OpenMode, &result);
+  ArchiveData->OpenResult = result;
+  return handle;
 }
 
 WCX_EXPORT int __stdcall ReadHeader(HANDLE hArcData, tHeaderDataA* HeaderData) {
@@ -849,12 +916,29 @@ std::string BuildDebugReport(const std::wstring& arcName,
   return out;
 }
 
-WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
-  (void)Mode;
-  if (!FileName || !*FileName) return nullptr;
+WCX_EXPORT HANDLE __stdcall OpenArchiveW(tOpenArchiveDataW* ArchiveData) {
+  if (!ArchiveData) return nullptr;
+  ArchiveData->CmtSize = 0;
+  ArchiveData->CmtState = 0;
+  if (!ArchiveData->ArcName || !*ArchiveData->ArcName) {
+    ArchiveData->OpenResult = E_EOPEN;
+    return nullptr;
+  }
+  int result = E_SUCCESS;
+  HANDLE handle = OpenArchivePath(std::wstring(ArchiveData->ArcName),
+                                  ArchiveData->OpenMode, &result);
+  ArchiveData->OpenResult = result;
+  return handle;
+}
 
-  const std::wstring src(FileName);
-  AppendLog("OpenArchiveW '" + WideToUtf8(src) + "'");
+HANDLE OpenArchivePath(const std::wstring& src, int mode, int* result) {
+  *result = E_SUCCESS;
+  if (mode != PK_OM_LIST && mode != PK_OM_EXTRACT) {
+    *result = E_NOT_SUPPORTED;
+    return nullptr;
+  }
+
+  AppendLog("OpenArchiveW '" + WideToUtf8(src) + "' mode=" + std::to_string(mode));
   std::vector<OpenAttempt> attempts;
   std::vector<Entry> entries;
   int bookmarkRows = 0;
@@ -1036,8 +1120,9 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
   return rc;
 }
 
-WCX_EXPORT void __stdcall CloseArchive(HANDLE hArcData) {
+WCX_EXPORT int __stdcall CloseArchive(HANDLE hArcData) {
   delete reinterpret_cast<ArchiveHandle*>(hArcData);
+  return E_SUCCESS;
 }
 
 WCX_EXPORT void __stdcall SetChangeVolProcW(HANDLE hArcData,
