@@ -811,6 +811,26 @@ std::string BuildDebugReport(const std::wstring& arcName,
   out += "Plugin build           : x86\r\n";
 #endif
   out += "sizeof(tHeaderDataExW) : " + std::to_string(sizeof(tHeaderDataExW)) + "\r\n";
+  out += "sqlite version         : " + std::string(sqlite3_libversion()) + "\r\n";
+
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  if (GetFileAttributesExW(arcName.c_str(), GetFileExInfoStandard, &info)) {
+    const unsigned long long size =
+        ((unsigned long long)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+    out += "database file          : " + std::to_string(size) + " bytes\r\n";
+  } else {
+    out += "database file          : cannot be read (error " +
+           std::to_string(GetLastError()) + ")\r\n";
+  }
+  const wchar_t* const sideFiles[] = {L"-wal", L"-shm"};
+  std::string sides;
+  for (const wchar_t* suffix : sideFiles) {
+    if (GetFileAttributesW((arcName + suffix).c_str()) != INVALID_FILE_ATTRIBUTES) {
+      sides += WideToUtf8(suffix + 1);
+      sides += " ";
+    }
+  }
+  out += "side files present     : " + (sides.empty() ? std::string("none") : sides) + "\r\n";
   out += "moz_bookmarks rows     : " + std::to_string(bookmarkRows) + "\r\n";
   if (!error.empty()) out += "Reason                 : " + error + "\r\n";
 
