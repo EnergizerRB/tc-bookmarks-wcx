@@ -242,15 +242,14 @@ class TempWorkspace {
 // ---------------------------------------------------------------------------
 
 struct Entry {
-  std::wstring arcName;   // path inside the archive, backslash separated
-  std::wstring fileName;  // base name handed to ProcessFileW
-  std::string content;    // .url payload (empty for directories)
-  bool isDir = false;
+  std::wstring path;    // relative path inside the archive, backslash separated
+  std::string content;  // .url payload
   DWORD dosTime = 0;
 };
 
 struct ArchiveHandle {
   std::vector<Entry> entries;
+  std::wstring archiveName;  // source database path, reported back as ArcName
   size_t index = 0;
   tChangeVolProcW changeVol = nullptr;
   tProcessDataProcW processData = nullptr;
@@ -280,17 +279,16 @@ std::wstring BookmarkBaseName(const Node& node) {
 Entry MakeBookmarkEntry(const Node& node, const std::wstring& name,
                         const std::wstring& parentPath) {
   Entry file;
-  file.fileName = name;
-  file.arcName = parentPath + name;
+  file.path = parentPath + name;
   file.dosTime = node.dosTime;
   file.content = "[InternetShortcut]\r\nURL=" + WideToUtf8(node.url) + "\r\n";
   return file;
 }
 
-void EmitChildren(const std::map<sqlite3_int64, Node>& nodes,
-                  const std::map<sqlite3_int64, std::vector<sqlite3_int64> >& children,
-                  sqlite3_int64 parentId, const std::wstring& parentPath,
-                  std::vector<Entry>& out, int depth) {
+void EmitTree(const std::map<sqlite3_int64, Node>& nodes,
+              const std::map<sqlite3_int64, std::vector<sqlite3_int64> >& children,
+              sqlite3_int64 parentId, const std::wstring& parentPath,
+              std::vector<Entry>& out, int depth) {
   if (depth > 64) return;
   std::map<sqlite3_int64, std::vector<sqlite3_int64> >::const_iterator it =
       children.find(parentId);
@@ -302,17 +300,11 @@ void EmitChildren(const std::map<sqlite3_int64, Node>& nodes,
     if (nit == nodes.end()) continue;
     const Node& node = nit->second;
 
-    if (node.type == 2) {  // folder
+    if (node.type == 2) {  // folder: only its contents are listed, the path of
+                           // every bookmark carries the folder name
       std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
       std::wstring name = UniqueName(base, L"", used);
-      Entry dir;
-      dir.isDir = true;
-      dir.fileName = name;
-      dir.arcName = parentPath + name;
-      dir.dosTime = node.dosTime;
-      out.push_back(dir);
-      EmitChildren(nodes, children, childId, parentPath + name + L"\\", out,
-                   depth + 1);
+      EmitTree(nodes, children, childId, parentPath + name + L"\\", out, depth + 1);
     } else if (node.type == 1) {  // bookmark
       if (node.url.empty()) continue;
       if (StartsWithNoCase(node.url, L"place:")) continue;
@@ -320,6 +312,39 @@ void EmitChildren(const std::map<sqlite3_int64, Node>& nodes,
       out.push_back(MakeBookmarkEntry(node, name, parentPath));
     }
   }
+}
+
+struct RootFolder {
+  const char* guid;
+  const wchar_t* name;
+};
+
+// The four top level folders of a Firefox profile, addressed by guid because the
+// numeric ids differ between profiles.
+const RootFolder kRootFolders[] = {
+    {"menu________", L"Меню закладок"},
+    {"toolbar_____", L"Панель закладок"},
+    {"unfiled_____", L"Другие закладки"},
+    {"mobile______", L"Мобильные закладки"},
+};
+
+std::map<std::string, sqlite3_int64> FindRootIds(sqlite3* db) {
+  std::map<std::string, sqlite3_int64> ids;
+  static const char* kSql =
+      "SELECT id, guid FROM moz_bookmarks WHERE guid IN "
+      "('menu________','toolbar_____','unfiled_____','mobile______')";
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, kSql, -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    return ids;
+  }
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    const unsigned char* guid = sqlite3_column_text(st, 1);
+    if (!guid) continue;
+    ids[reinterpret_cast<const char*>(guid)] = sqlite3_column_int64(st, 0);
+  }
+  sqlite3_finalize(st);
+  return ids;
 }
 
 bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
@@ -359,22 +384,22 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out) {
 
   if (nodes.empty()) return false;
 
-  std::vector<sqlite3_int64> roots;
-  for (std::map<sqlite3_int64, Node>::const_iterator it = nodes.begin();
-       it != nodes.end(); ++it) {
-    if (it->second.parent == 0 || nodes.find(it->second.parent) == nodes.end()) {
-      roots.push_back(it->first);
-    }
+  const std::map<std::string, sqlite3_int64> rootIds = FindRootIds(db);
+  for (const RootFolder& root : kRootFolders) {
+    std::map<std::string, sqlite3_int64>::const_iterator it = rootIds.find(root.guid);
+    if (it == rootIds.end()) continue;
+    EmitTree(nodes, children, it->second, std::wstring(root.name) + L"\\", out, 0);
   }
-  if (roots.empty()) return false;
 
-  for (sqlite3_int64 rootId : roots) {
-    const Node& root = nodes[rootId];
-    if (root.type == 2) {
-      EmitChildren(nodes, children, rootId, L"", out, 0);
-    } else if (root.type == 1 && !root.url.empty() &&
-               !StartsWithNoCase(root.url, L"place:")) {
-      out.push_back(MakeBookmarkEntry(root, BookmarkBaseName(root) + L".url", L""));
+  if (out.empty()) {
+    // Databases without the guid column: fall back to the folders that sit
+    // directly below the root, keeping their stored titles.
+    for (std::map<sqlite3_int64, Node>::const_iterator it = nodes.begin();
+         it != nodes.end(); ++it) {
+      const Node& node = it->second;
+      if (node.type != 2 || node.parent != 1) continue;
+      std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
+      EmitTree(nodes, children, it->first, base + L"\\", out, 0);
     }
   }
   return !out.empty();
@@ -422,19 +447,20 @@ const Entry* FindEntry(ArchiveHandle* handle, LPCWSTR destName) {
     if (c == L'/') c = L'\\';
   }
   for (const Entry& e : handle->entries) {
-    if (_wcsicmp(e.arcName.c_str(), name.c_str()) == 0) return &e;
+    if (_wcsicmp(e.path.c_str(), name.c_str()) == 0) return &e;
   }
+  // Total Commander may pass just the file name when a single file is extracted;
+  // accept it as long as it identifies exactly one entry.
+  const Entry* match = nullptr;
   for (const Entry& e : handle->entries) {
-    if (_wcsicmp(e.fileName.c_str(), name.c_str()) == 0) return &e;
+    const size_t slash = e.path.rfind(L'\\');
+    const std::wstring base =
+        (slash == std::wstring::npos) ? e.path : e.path.substr(slash + 1);
+    if (_wcsicmp(base.c_str(), name.c_str()) != 0) continue;
+    if (match) return nullptr;
+    match = &e;
   }
-  size_t slash = name.find_last_of(L'\\');
-  if (slash != std::wstring::npos) {
-    std::wstring base = name.substr(slash + 1);
-    for (const Entry& e : handle->entries) {
-      if (_wcsicmp(e.fileName.c_str(), base.c_str()) == 0) return &e;
-    }
-  }
-  return nullptr;
+  return match;
 }
 
 void CreateParentDirectories(const std::wstring& path) {
@@ -590,6 +616,7 @@ WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
 
   ArchiveHandle* handle = new (std::nothrow) ArchiveHandle();
   if (!handle) return nullptr;
+  handle->archiveName = src;
   handle->entries.swap(entries);
   return reinterpret_cast<HANDLE>(handle);
 }
@@ -601,10 +628,10 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
 
   const Entry& entry = handle->entries[handle->index++];
   ZeroMemory(HeaderData, sizeof(*HeaderData));
-  lstrcpynW(HeaderData->ArcName, entry.arcName.c_str(), 1024);
-  lstrcpynW(HeaderData->FileName, entry.fileName.c_str(), 1024);
+  lstrcpynW(HeaderData->ArcName, handle->archiveName.c_str(), 1024);
+  lstrcpynW(HeaderData->FileName, entry.path.c_str(), 1024);
 
-  const DWORD size = entry.isDir ? 0 : (DWORD)entry.content.size();
+  const DWORD size = (DWORD)entry.content.size();
   HeaderData->Flags = 0;
   HeaderData->PackSizeHigh = 0;
   HeaderData->PackSize = size;
@@ -615,8 +642,7 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
   HeaderData->FileTime = (int)entry.dosTime;
   HeaderData->UnpVer = 1;
   HeaderData->Method = 0;
-  HeaderData->FileAttr =
-      entry.isDir ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
+  HeaderData->FileAttr = FILE_ATTRIBUTE_ARCHIVE;
   HeaderData->CmtBuf = nullptr;
   HeaderData->CmtBufSize = 0;
   HeaderData->CmtSize = 0;
@@ -633,15 +659,18 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
 
   const Entry* entry = FindEntry(handle, DestName);
   if (!entry) return E_BAD_ARCHIVE;
-  if (entry->isDir) return E_SUCCESS;
 
   std::wstring target;
   if (DestPath && *DestPath) {
     target = DestPath;
     if (target.back() != L'\\' && target.back() != L'/') target += L'\\';
   }
-  target += (DestName && *DestName) ? DestName : entry->fileName;
+  const wchar_t* relative = (DestName && *DestName) ? DestName : entry->path.c_str();
+  while (*relative == L'\\' || *relative == L'/') ++relative;
+  target += relative;
 
+  // Total Commander hands over the whole relative path, so the folders that the
+  // listing only implies have to be created here.
   CreateParentDirectories(target);
 
   HANDLE file = CreateFileW(target.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -655,7 +684,7 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
   if (!ok || written != entry->content.size()) return E_EWRITE;
 
   if (handle->processData) {
-    handle->processData(const_cast<LPWSTR>(entry->fileName.c_str()),
+    handle->processData(const_cast<LPWSTR>(entry->path.c_str()),
                         (int)entry->content.size());
   }
   return E_SUCCESS;
