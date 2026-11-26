@@ -459,6 +459,99 @@ void CreateParentDirectories(const std::wstring& path) {
 // Exported WCX interface
 // ---------------------------------------------------------------------------
 
+// Total Commander resolves the ANSI and the Unicode entry points with
+// GetProcAddress while loading a WCX and refuses the plugin when one of them is
+// missing, even though a Unicode plugin is driven only through the *W calls.
+// The ANSI entry points exist so the load check passes; they reject every call
+// because all real work happens in the wide versions below.
+
+typedef int(__stdcall* tChangeVolProcA)(LPSTR ArcName, int Mode);
+typedef int(__stdcall* tProcessDataProcA)(LPSTR FileName, int Size);
+
+struct tHeaderDataA {
+  char ArcName[260];
+  char FileName[260];
+  int Flags;
+  int PackSize;
+  int UnpSize;
+  int HostOS;
+  int FileCRC;
+  int FileTime;
+  int UnpVer;
+  int Method;
+  int FileAttr;
+  char* CmtBuf;
+  int CmtBufSize;
+  int CmtSize;
+  int CmtState;
+};
+
+struct tHeaderDataExA {
+  char ArcName[1024];
+  char FileName[1024];
+  int Flags;
+  DWORD PackSizeHigh;
+  DWORD PackSize;
+  DWORD UnpSizeHigh;
+  DWORD UnpSize;
+  int HostOS;
+  int FileCRC;
+  int FileTime;
+  int UnpVer;
+  int Method;
+  int FileAttr;
+  char* CmtBuf;
+  int CmtBufSize;
+  int CmtSize;
+  int CmtState;
+  int Reserved[1024];
+};
+
+WCX_EXPORT HANDLE __stdcall OpenArchive(LPSTR FileName, int Mode) {
+  (void)FileName;
+  (void)Mode;
+  return nullptr;
+}
+
+WCX_EXPORT int __stdcall ReadHeader(HANDLE hArcData, tHeaderDataA* HeaderData) {
+  (void)hArcData;
+  (void)HeaderData;
+  return E_NOT_SUPPORTED;
+}
+
+WCX_EXPORT int __stdcall ReadHeaderEx(HANDLE hArcData,
+                                      tHeaderDataExA* HeaderData) {
+  (void)hArcData;
+  (void)HeaderData;
+  return E_NOT_SUPPORTED;
+}
+
+WCX_EXPORT int __stdcall ProcessFile(HANDLE hArcData, int Operation,
+                                     LPSTR DestPath, LPSTR DestName) {
+  (void)hArcData;
+  (void)Operation;
+  (void)DestPath;
+  (void)DestName;
+  return E_NOT_SUPPORTED;
+}
+
+WCX_EXPORT void __stdcall SetChangeVolProc(HANDLE hArcData,
+                                           tChangeVolProcA pChangeVolProc) {
+  (void)hArcData;
+  (void)pChangeVolProc;
+}
+
+WCX_EXPORT void __stdcall SetProcessDataProc(HANDLE hArcData,
+                                             tProcessDataProcA pProcessDataProc) {
+  (void)hArcData;
+  (void)pProcessDataProc;
+}
+
+WCX_EXPORT BOOL __stdcall CanYouHandleThisFile(LPSTR FileName) {
+  (void)FileName;
+  return FALSE;
+}
+
 WCX_EXPORT HANDLE __stdcall OpenArchiveW(LPWSTR FileName, int Mode) {
   (void)Mode;
   if (!FileName || !*FileName) return nullptr;
@@ -568,9 +661,8 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
   return E_SUCCESS;
 }
 
-WCX_EXPORT int __stdcall CloseArchive(HANDLE hArcData) {
+WCX_EXPORT void __stdcall CloseArchive(HANDLE hArcData) {
   delete reinterpret_cast<ArchiveHandle*>(hArcData);
-  return E_SUCCESS;
 }
 
 WCX_EXPORT void __stdcall SetChangeVolProcW(HANDLE hArcData,

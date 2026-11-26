@@ -88,32 +88,61 @@ jobs:
         shell: msys2 {0}
         run: |
           set -e
+          # The trailing -Wl,-Bstatic keeps libstdc++/libgcc static: -Bdynamic
+          # switches the whole link back to shared libraries, which would add
+          # a libstdc++-6.dll dependency.
           echo "== x86_64 =="
           g++ -std=c++17 -O2 -Wall -Wextra -DUNICODE -D_UNICODE \
-            -shared -o places_wcx.wcx64 places_wcx.cpp sqlite3-x64.o -I. \
-            -static -static-libgcc -static-libstdc++ -Wl,--kill-at
+            -shared -o places_wcx.wcx64 places_wcx.cpp sqlite3-x64.o -I. places_wcx.def \
+            -static -static-libgcc -static-libstdc++ \
+            -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -Wl,-Bstatic \
+            -Wl,--kill-at
           echo "== i686 =="
           PATH=/mingw32/bin:$PATH /mingw32/bin/g++ -std=c++17 -O2 -Wall -Wextra \
             -DUNICODE -D_UNICODE \
-            -shared -o places_wcx.wcx places_wcx.cpp sqlite3-x86.o -I. \
-            -static -static-libgcc -static-libstdc++ -Wl,--kill-at
+            -shared -o places_wcx.wcx places_wcx.cpp sqlite3-x86.o -I. places_wcx.def \
+            -static -static-libgcc -static-libstdc++ \
+            -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic -Wl,-Bstatic \
+            -Wl,--kill-at
           ls -l places_wcx.wcx64 places_wcx.wcx
 
       - name: Verify exported WCX entry points
         shell: msys2 {0}
         run: |
           set -e
+          exec 2>&1
+          exports="OpenArchive OpenArchiveW ReadHeader ReadHeaderEx ReadHeaderExW
+                   ProcessFile ProcessFileW CloseArchive GetPackerCaps
+                   CanYouHandleThisFile CanYouHandleThisFileW
+                   SetChangeVolProc SetChangeVolProcW
+                   SetProcessDataProc SetProcessDataProcW"
           for pair in "places_wcx.wcx64:objdump" "places_wcx.wcx:mingw32-objdump"; do
             file="${pair%%:*}"
             tool="${pair##*:}"
-            echo "== $file =="
-            test -f "$file"
             if [ "$tool" = "mingw32-objdump" ]; then
-              tool="/mingw32/bin/objdump"
+              tool=/mingw32/bin/objdump
               PATH=/mingw32/bin:$PATH
             fi
-            $tool -p "$file" | grep -E 'CanYouHandleThisFileW|CloseArchive|GetPackerCaps|OpenArchiveW|ProcessFileW|ReadHeaderExW|SetChangeVolProcW|SetProcessDataProcW'
-            $tool -p "$file" | grep 'DLL Name'
+            echo "== $file =="
+            test -f "$file"
+            dump="$($tool -p "$file" | tr -d '\r')"
+            for name in $exports; do
+              echo "$dump" | grep -q " $name\$" || {
+                echo "::error::$file does not export $name"
+                exit 1
+              }
+            done
+            echo "all 15 entry points exported"
+            for dll in $(echo "$dump" | grep 'DLL Name' | awk '{print $3}'); do
+              case "$(echo "$dll" | tr 'A-Z' 'a-z')" in
+                kernel32.dll|msvcrt.dll|ucrtbase.dll|user32.dll|advapi32.dll|api-ms-win-crt-*) ;;
+                *)
+                  echo "::error::$file imports $dll"
+                  exit 1
+                  ;;
+              esac
+            done
+            echo "$dump" | grep 'DLL Name'
             ls -l "$file"
           done
 

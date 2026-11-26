@@ -1,0 +1,22 @@
+; Export list of the WCX plugin.
+;
+; Total Commander loads a packer plugin only when every entry point below can be
+; resolved, ANSI and Unicode alike, so the whole set is listed explicitly instead
+; of relying on compiler decoration rules.
+
+EXPORTS
+    OpenArchive
+    OpenArchiveW
+    ReadHeader
+    ReadHeaderEx
+    ReadHeaderExW
+    ProcessFile
+    ProcessFileW
+    CloseArchive
+    GetPackerCaps
+    CanYouHandleThisFile
+    CanYouHandleThisFileW
+    SetChangeVolProc
+    SetChangeVolProcW
+    SetProcessDataProc
+    SetProcessDataProcW
