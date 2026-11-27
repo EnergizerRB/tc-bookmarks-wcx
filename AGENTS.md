@@ -29,9 +29,13 @@ table against it, so a new entry point must be added there too.
   handle without checking it against the registry in this file.
 - The number in `[PackerPlugins]` of `wincmd.ini` is the mask cached from
   `GetPackerCaps` (1 new, 2 modify, 4 multiple, 8 delete, 16 options, 32 mempack,
-  64 by content, 128 search, 256 hide, 512 encrypt). Total Commander only calls
-  `GetPackerCaps` when the plugin is installed, so a stale mask keeps the old
-  behaviour after a rebuild: remove and re-add the plugin.
+  64 by content, 128 search, 256 hide, 512 encrypt); this plugin needs 79.
+  Total Commander only calls `GetPackerCaps` when the plugin is added, so a stale
+  mask keeps the old behaviour after a rebuild, and an empty number disables the
+  plugin completely ("No program associated with ..."). Fix it by writing 79 into
+  the entry, or by removing and re-adding the plugin.
+- Replacing the DLL while Total Commander runs changes nothing: Windows keeps the
+  loaded copy. Restart Total Commander after every rebuild.
 - Packing into an archive requires the new bit; modifying an existing one also
   needs the modify bit. Without them TC answers "Function not supported!".
 - Deleting a folder sends the mask `Folder\*.*`, which means the folder and
