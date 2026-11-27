@@ -20,7 +20,9 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cwctype>
 #include <map>
+#include <mutex>
 #include <new>
 #include <set>
 #include <string>
@@ -45,6 +47,7 @@
 #define PLACES_WCX_ARCH "x86"
 #endif
 
+#define PK_CAPS_NEW 1
 #define PK_CAPS_MODIFY 2
 #define PK_CAPS_MULTIPLE 4
 #define PK_CAPS_DELETE 8
@@ -56,6 +59,7 @@
 #define E_BAD_ARCHIVE 13
 #define E_ECREATE 16
 #define E_EWRITE 19
+#define E_EABORTED 21
 #define E_NOT_SUPPORTED 24
 
 typedef int(__stdcall* tChangeVolProcW)(LPWSTR ArcName, int Mode);
@@ -219,7 +223,7 @@ DWORD CurrentDosTime() {
   if (!SystemTimeToFileTime(&st, &ft) || !FileTimeToDosDateTime(&ft, &date, &time)) {
     return 0;
   }
-  return ((DWORD)time << 16) | date;
+  return ((DWORD)date << 16) | time;
 }
 
 DWORD DosTimeFromFirefoxMicros(sqlite3_int64 micros) {
@@ -234,7 +238,7 @@ DWORD DosTimeFromFirefoxMicros(sqlite3_int64 micros) {
   WORD date = 0, time = 0;
   if (!FileTimeToLocalFileTime(&ft, &local)) return CurrentDosTime();
   if (!FileTimeToDosDateTime(&local, &date, &time)) return CurrentDosTime();
-  return ((DWORD)time << 16) | date;
+  return ((DWORD)date << 16) | time;
 }
 
 bool IsReservedDeviceName(const std::wstring& name) {
@@ -548,6 +552,7 @@ struct Entry {
   std::string content;  // .url payload
   DWORD dosTime = 0;
   sqlite3_int64 nodeId = 0;  // row in moz_bookmarks, used by delete and rename
+  bool isDirectory = false;
 };
 
 struct ArchiveHandle {
@@ -558,6 +563,41 @@ struct ArchiveHandle {
   tChangeVolProcW changeVol = nullptr;
   tProcessDataProcW processData = nullptr;
 };
+
+// Total Commander calls the two callback setters with a placeholder handle
+// (it passes -1) right before packing or deleting, when no archive is open at
+// all, so a handle may only be dereferenced after it was handed out here.
+std::mutex g_handleMutex;
+std::set<ArchiveHandle*> g_liveHandles;
+tProcessDataProcW g_processDataProc = nullptr;
+tChangeVolProcW g_changeVolProc = nullptr;
+
+void RememberHandle(ArchiveHandle* handle) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  g_liveHandles.insert(handle);
+}
+
+void ForgetHandle(ArchiveHandle* handle) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  g_liveHandles.erase(handle);
+}
+
+ArchiveHandle* LookupHandle(HANDLE arcData) {
+  std::lock_guard<std::mutex> lock(g_handleMutex);
+  ArchiveHandle* handle = reinterpret_cast<ArchiveHandle*>(arcData);
+  return g_liveHandles.count(handle) ? handle : nullptr;
+}
+
+// Progress callback for the operations that run without an open archive.
+bool ReportProgress(const std::wstring& name, int size) {
+  tProcessDataProcW proc = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_handleMutex);
+    proc = g_processDataProc;
+  }
+  if (!proc) return true;
+  return proc(const_cast<LPWSTR>(name.c_str()), size) != FALSE;
+}
 
 struct Node {
   sqlite3_int64 id = 0;
@@ -578,6 +618,16 @@ std::wstring BookmarkBaseName(const Node& node) {
   std::wstring base = SanitizeName(node.title.empty() ? node.url : node.title);
   if (EndsWithNoCase(base, L".url")) base.resize(base.size() - 4);
   return base.empty() ? std::wstring(L"Bookmark") : base;
+}
+
+Entry MakeFolderEntry(const Node& node, const std::wstring& name,
+                      const std::wstring& parentPath) {
+  Entry dir;
+  dir.path = parentPath + name + L"\\";
+  dir.dosTime = node.dosTime;
+  dir.nodeId = node.id;
+  dir.isDirectory = true;
+  return dir;
 }
 
 Entry MakeBookmarkEntry(const Node& node, const std::wstring& name,
@@ -606,11 +656,11 @@ void EmitTree(const std::map<sqlite3_int64, Node>& nodes,
     if (nit == nodes.end()) continue;
     const Node& node = nit->second;
 
-    if (node.type == 2) {  // folder: only its contents are listed, the path of
-                           // every bookmark carries the folder name
+    if (node.type == 2) {
       std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
       std::wstring name = UniqueName(base, L"", used);
       if (folderIds) (*folderIds)[ToLower(parentPath + name)] = childId;
+      out.push_back(MakeFolderEntry(node, name, parentPath));
       EmitTree(nodes, children, childId, parentPath + name + L"\\", out, depth + 1,
                folderIds);
     } else if (node.type == 1) {  // bookmark
@@ -725,6 +775,9 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
     std::map<std::string, sqlite3_int64>::const_iterator it = rootIds.find(root.guid);
     if (it == rootIds.end()) continue;
     if (folderIds) (*folderIds)[ToLower(root.name)] = it->second;
+    Node rootNode;
+    rootNode.id = it->second;
+    out.push_back(MakeFolderEntry(rootNode, root.name, std::wstring()));
     EmitTree(nodes, children, it->second, std::wstring(root.name) + L"\\", out, 0,
              folderIds);
   }
@@ -738,6 +791,7 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
       if (node.type != 2 || node.parent != 1) continue;
       std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
       if (folderIds) (*folderIds)[ToLower(base)] = it->first;
+      out.push_back(MakeFolderEntry(node, base, std::wstring()));
       EmitTree(nodes, children, it->first, base + L"\\", out, 0, folderIds);
     }
   }
@@ -1167,6 +1221,7 @@ HANDLE OpenArchivePath(const std::wstring& src, int mode, int* result) {
   if (!handle) return nullptr;
   handle->archiveName = src;
   handle->entries.swap(entries);
+  RememberHandle(handle);
   return reinterpret_cast<HANDLE>(handle);
 }
 
@@ -1181,7 +1236,7 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
   lstrcpynW(HeaderData->ArcName, handle->archiveName.c_str(), 1024);
   lstrcpynW(HeaderData->FileName, entry.path.c_str(), 1024);
 
-  const DWORD size = (DWORD)entry.content.size();
+  const DWORD size = entry.isDirectory ? 0 : (DWORD)entry.content.size();
   HeaderData->Flags = 0;
   HeaderData->PackSizeHigh = 0;
   HeaderData->PackSize = size;
@@ -1192,7 +1247,7 @@ WCX_EXPORT int __stdcall ReadHeaderExW(HANDLE hArcData, tHeaderDataExW* HeaderDa
   HeaderData->FileTime = (int)entry.dosTime;
   HeaderData->UnpVer = 1;
   HeaderData->Method = 0;
-  HeaderData->FileAttr = FILE_ATTRIBUTE_ARCHIVE;
+  HeaderData->FileAttr = entry.isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_ARCHIVE;
   HeaderData->CmtBuf = nullptr;
   HeaderData->CmtBufSize = 0;
   HeaderData->CmtSize = 0;
@@ -1241,6 +1296,7 @@ int ExtractEntry(ArchiveHandle* handle, int Operation, LPWSTR DestPath,
   }
   if (!entry && handle->entries.size() == 1) entry = &handle->entries[0];
   if (!entry) return E_BAD_ARCHIVE;
+  if (entry->isDirectory) return E_SUCCESS;
 
   std::wstring target;
   if (!destPath.empty() && LooksLikeFilePath(destPath)) {
@@ -1291,20 +1347,29 @@ WCX_EXPORT int __stdcall ProcessFileW(HANDLE hArcData, int Operation,
 }
 
 WCX_EXPORT int __stdcall CloseArchive(HANDLE hArcData) {
-  delete reinterpret_cast<ArchiveHandle*>(hArcData);
+  if (ArchiveHandle* handle = LookupHandle(hArcData)) {
+    ForgetHandle(handle);
+    delete handle;
+  }
   return E_SUCCESS;
 }
 
 WCX_EXPORT void __stdcall SetChangeVolProcW(HANDLE hArcData,
                                             tChangeVolProcW pChangeVolProcW) {
-  ArchiveHandle* handle = reinterpret_cast<ArchiveHandle*>(hArcData);
-  if (handle) handle->changeVol = pChangeVolProcW;
+  {
+    std::lock_guard<std::mutex> lock(g_handleMutex);
+    g_changeVolProc = pChangeVolProcW;
+  }
+  if (ArchiveHandle* handle = LookupHandle(hArcData)) handle->changeVol = pChangeVolProcW;
 }
 
 WCX_EXPORT void __stdcall SetProcessDataProcW(HANDLE hArcData,
                                               tProcessDataProcW pProcessDataProcW) {
-  ArchiveHandle* handle = reinterpret_cast<ArchiveHandle*>(hArcData);
-  if (handle) handle->processData = pProcessDataProcW;
+  {
+    std::lock_guard<std::mutex> lock(g_handleMutex);
+    g_processDataProc = pProcessDataProcW;
+  }
+  if (ArchiveHandle* handle = LookupHandle(hArcData)) handle->processData = pProcessDataProcW;
 }
 
 // ---------------------------------------------------------------------------
@@ -1409,9 +1474,59 @@ bool HasColumn(sqlite3* db, const char* table, const char* column) {
   return found;
 }
 
+bool FileExists(const std::wstring& path) {
+  const DWORD attributes = GetFileAttributesW(path.c_str());
+  return attributes != INVALID_FILE_ATTRIBUTES &&
+         (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+// Mirrors the parts of the Firefox schema this plugin reads and writes, so a
+// database created here behaves like a profile that holds no bookmarks yet.
+bool CreateEmptyPlacesDb(const std::wstring& path, std::string& error) {
+  sqlite3* db = nullptr;
+  const std::string utf8 = WideToUtf8(path);
+  if (sqlite3_open_v2(utf8.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                      nullptr) != SQLITE_OK) {
+    error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
+    if (db) sqlite3_close(db);
+    return false;
+  }
+  static const char* kSchema =
+      "CREATE TABLE moz_places ("
+      " id INTEGER PRIMARY KEY, url LONGVARCHAR, title LONGVARCHAR,"
+      " rev_host LONGVARCHAR, visit_count INTEGER DEFAULT 0,"
+      " hidden INTEGER DEFAULT 0, typed INTEGER DEFAULT 0,"
+      " frecency INTEGER DEFAULT -1, last_visit_date INTEGER,"
+      " guid TEXT, foreign_count INTEGER DEFAULT 0);"
+      "CREATE TABLE moz_bookmarks ("
+      " id INTEGER PRIMARY KEY, type INTEGER, fk INTEGER DEFAULT NULL,"
+      " parent INTEGER, position INTEGER, title LONGVARCHAR,"
+      " keyword_id INTEGER, folder_type TEXT, dateAdded INTEGER,"
+      " lastModified INTEGER, guid TEXT);"
+      "CREATE INDEX moz_bookmarks_parent ON moz_bookmarks (parent);"
+      "CREATE INDEX moz_places_url ON moz_places (url);"
+      "INSERT INTO moz_bookmarks (id, type, parent, position, title, dateAdded,"
+      " lastModified, guid) VALUES"
+      " (1, 2, 0, 0, '', 0, 0, 'root________'),"
+      " (2, 2, 1, 0, 'Bookmarks Menu', 0, 0, 'menu________'),"
+      " (3, 2, 1, 1, 'Bookmarks Toolbar', 0, 0, 'toolbar_____'),"
+      " (4, 2, 1, 2, 'Other Bookmarks', 0, 0, 'unfiled_____'),"
+      " (5, 2, 1, 3, 'Mobile Bookmarks', 0, 0, 'mobile______');";
+  char* message = nullptr;
+  if (sqlite3_exec(db, kSchema, nullptr, nullptr, &message) != SQLITE_OK) {
+    error = message ? message : "cannot create the database schema";
+    if (message) sqlite3_free(message);
+    sqlite3_close(db);
+    return false;
+  }
+  sqlite3_close(db);
+  return true;
+}
+
 sqlite3* OpenForWrite(const std::wstring& path, std::string& error) {
   sqlite3* db = nullptr;
   const std::string utf8 = WideToUtf8(path);
+  if (!FileExists(path) && !CreateEmptyPlacesDb(path, error)) return nullptr;
   const int rc = sqlite3_open_v2(utf8.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr);
   if (rc != SQLITE_OK) {
     error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
@@ -1821,7 +1936,10 @@ std::wstring StripPrefix(const std::wstring& path, const std::wstring& prefix) {
 // has been told about the capabilities: an already installed plugin has to be
 // removed and added again, otherwise the old mask stays in effect.
 WCX_EXPORT int __stdcall GetPackerCaps(void) {
-  const int caps = PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
+  // Total Commander refuses to pack into an archive unless the plugin claims
+  // PK_CAPS_NEW, so a fresh database is created when the target is missing.
+  const int caps = PK_CAPS_NEW | PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE |
+                   PK_CAPS_BY_CONTENT;
   AppendLog("GetPackerCaps -> " + std::to_string(caps) + " build=" __DATE__ " " __TIME__);
   return caps;
 }
@@ -1864,7 +1982,9 @@ WCX_EXPORT int __stdcall PackFilesW(LPWSTR PackedFile, LPWSTR SubPath, LPWSTR Sr
 
   std::map<std::wstring, sqlite3_int64> files;
   for (size_t i = 0; i < entries.size(); ++i) {
-    files[ToLower(entries[i].path)] = entries[i].nodeId;
+    std::wstring key = ToLower(entries[i].path);
+    while (!key.empty() && (key.back() == L'\\' || key.back() == L'/')) key.pop_back();
+    files[key] = entries[i].nodeId;
   }
 
   const std::wstring sourceDir = SrcPath ? SrcPath : L"";
@@ -1898,6 +2018,11 @@ WCX_EXPORT int __stdcall PackFilesW(LPWSTR PackedFile, LPWSTR SubPath, LPWSTR Sr
   for (const WCHAR* item = AddList; item && *item && ok; item += wcslen(item) + 1) {
     const std::wstring raw(item);
     const std::wstring relative = StripPrefix(raw, sourceDir);
+    if (!ReportProgress(relative, 0)) {
+      ExecSql(db, "ROLLBACK", error);
+      sqlite3_close(db);
+      return E_EABORTED;
+    }
     const bool trailingSlash =
         !relative.empty() && (relative.back() == L'\\' || relative.back() == L'/');
 
@@ -1989,6 +2114,43 @@ WCX_EXPORT int __stdcall PackFilesW(LPWSTR PackedFile, LPWSTR SubPath, LPWSTR Sr
   return E_SUCCESS;
 }
 
+std::wstring ParentKey(const std::wstring& key) {
+  const size_t cut = key.find_last_of(L"\\/");
+  return cut == std::wstring::npos ? std::wstring() : key.substr(0, cut);
+}
+
+std::wstring LeafKey(const std::wstring& key) {
+  const size_t cut = key.find_last_of(L"\\/");
+  return cut == std::wstring::npos ? key : key.substr(cut + 1);
+}
+
+bool HasWildcard(const std::wstring& text) {
+  return text.find(L'*') != std::wstring::npos || text.find(L'?') != std::wstring::npos;
+}
+
+bool WildcardMatch(const std::wstring& mask, const std::wstring& name) {
+  size_t m = 0;
+  size_t n = 0;
+  size_t star = std::wstring::npos;
+  size_t mark = 0;
+  while (n < name.size()) {
+    if (m < mask.size() && (mask[m] == L'?' || towlower(mask[m]) == towlower(name[n]))) {
+      ++m;
+      ++n;
+    } else if (m < mask.size() && mask[m] == L'*') {
+      star = m++;
+      mark = n;
+    } else if (star != std::wstring::npos) {
+      m = star + 1;
+      n = ++mark;
+    } else {
+      return false;
+    }
+  }
+  while (m < mask.size() && mask[m] == L'*') ++m;
+  return m == mask.size();
+}
+
 WCX_EXPORT int __stdcall DeleteFilesW(LPWSTR PackedFile, LPWSTR DeleteList) {
   const std::wstring archive = PackedFile ? PackedFile : L"";
   AppendLog("DeleteFilesW pack='" + WideToUtf8(archive) + "'");
@@ -2023,7 +2185,9 @@ WCX_EXPORT int __stdcall DeleteFilesW(LPWSTR PackedFile, LPWSTR DeleteList) {
 
   std::map<std::wstring, sqlite3_int64> files;
   for (size_t i = 0; i < entries.size(); ++i) {
-    files[ToLower(entries[i].path)] = entries[i].nodeId;
+    std::wstring key = ToLower(entries[i].path);
+    while (!key.empty() && (key.back() == L'\\' || key.back() == L'/')) key.pop_back();
+    files[key] = entries[i].nodeId;
   }
 
   if (!ExecSql(db, "BEGIN IMMEDIATE", error)) {
@@ -2035,28 +2199,76 @@ WCX_EXPORT int __stdcall DeleteFilesW(LPWSTR PackedFile, LPWSTR DeleteList) {
   int deleted = 0;
   int requested = 0;
   for (const WCHAR* item = DeleteList; *item; item += wcslen(item) + 1) {
+    if (!ReportProgress(item, 0)) {
+      ExecSql(db, "ROLLBACK", error);
+      sqlite3_close(db);
+      return E_EABORTED;
+    }
     std::wstring key = ToLower(item);
     while (!key.empty() && (key.back() == L'\\' || key.back() == L'/')) key.pop_back();
     if (key.empty()) continue;
     ++requested;
 
-    sqlite3_int64 id = 0;
-    std::map<std::wstring, sqlite3_int64>::const_iterator fit = files.find(key);
-    if (fit != files.end()) {
-      id = fit->second;
+    // A folder is removed with the mask "Folder\*.*", which stands for the
+    // folder itself plus everything below it.
+    const std::wstring parent = ParentKey(key);
+    const std::wstring leaf = LeafKey(key);
+    std::set<std::wstring> victims;
+    if (HasWildcard(leaf)) {
+      std::map<std::wstring, sqlite3_int64>::const_iterator it;
+      for (it = files.begin(); it != files.end(); ++it) {
+        if (ParentKey(it->first) == parent && WildcardMatch(leaf, LeafKey(it->first))) {
+          victims.insert(it->first);
+        }
+      }
+      for (it = folders.begin(); it != folders.end(); ++it) {
+        if (ParentKey(it->first) == parent && WildcardMatch(leaf, LeafKey(it->first))) {
+          victims.insert(it->first);
+        }
+      }
+      if ((leaf == L"*.*" || leaf == L"*") && !parent.empty()) victims.insert(parent);
     } else {
-      std::map<std::wstring, sqlite3_int64>::const_iterator dit = folders.find(key);
-      if (dit != folders.end()) id = dit->second;
+      victims.insert(key);
     }
-    if (!id) {
-      AppendLog("  not in the archive: '" + WideToUtf8(key) + "'");
-      continue;
-    }
-    std::string why;
-    if (DeleteNode(db, id, why)) {
+
+    for (std::set<std::wstring>::const_iterator victim = victims.begin();
+         victim != victims.end(); ++victim) {
+      if (victim->empty()) continue;
+      sqlite3_int64 id = 0;
+      std::map<std::wstring, sqlite3_int64>::const_iterator fit = files.find(*victim);
+      if (fit != files.end()) {
+        id = fit->second;
+      } else {
+        std::map<std::wstring, sqlite3_int64>::const_iterator dit = folders.find(*victim);
+        if (dit != folders.end()) id = dit->second;
+      }
+      if (!id) {
+        AppendLog("  not in the archive: '" + WideToUtf8(*victim) + "'");
+        continue;
+      }
+      std::string why;
+      if (!DeleteNode(db, id, why)) {
+        AppendLog("  delete failed '" + WideToUtf8(*victim) + "': " + why);
+        continue;
+      }
       ++deleted;
-    } else {
-      AppendLog("  delete failed '" + WideToUtf8(key) + "': " + why);
+      // Everything below a removed folder went with it.
+      const std::wstring prefix = *victim + L"\\";
+      for (std::map<std::wstring, sqlite3_int64>::iterator it = files.begin(); it != files.end();) {
+        if (it->first == *victim || it->first.compare(0, prefix.size(), prefix) == 0) {
+          files.erase(it++);
+        } else {
+          ++it;
+        }
+      }
+      for (std::map<std::wstring, sqlite3_int64>::iterator it = folders.begin();
+           it != folders.end();) {
+        if (it->first == *victim || it->first.compare(0, prefix.size(), prefix) == 0) {
+          folders.erase(it++);
+        } else {
+          ++it;
+        }
+      }
     }
   }
 
