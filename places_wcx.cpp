@@ -672,7 +672,21 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
   }
 
   if (out.empty()) {
-    error = "the menu/toolbar/unfiled/mobile folders contain no bookmarks";
+    // Last resort: the profile has an unfamiliar folder layout, so list every
+    // bookmark that carries a URL and name the folder it lives in.
+    std::set<std::wstring> used;
+    for (std::map<sqlite3_int64, Node>::const_iterator it = nodes.begin();
+         it != nodes.end(); ++it) {
+      const Node& node = it->second;
+      if (node.type != 1 || node.url.empty()) continue;
+      if (StartsWithNoCase(node.url, L"place:")) continue;
+      const std::wstring name = UniqueName(BookmarkBaseName(node), L".url", used);
+      out.push_back(MakeBookmarkEntry(node, name, std::wstring()));
+    }
+  }
+
+  if (out.empty()) {
+    error = "the database holds no bookmark with a URL";
     return false;
   }
   return true;
@@ -862,6 +876,48 @@ WCX_EXPORT BOOL __stdcall CanYouHandleThisFile(LPSTR FileName) {
   return FALSE;
 }
 
+std::string FileHeaderHex(const std::wstring& path) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return std::string("cannot open");
+  unsigned char buffer[16] = {0};
+  DWORD read = 0;
+  const BOOL ok = ReadFile(file, buffer, sizeof(buffer), &read, nullptr);
+  CloseHandle(file);
+  if (!ok || read == 0) return std::string("empty");
+  std::string hex;
+  char byte[4];
+  for (DWORD i = 0; i < read; ++i) {
+    std::snprintf(byte, sizeof(byte), "%02X ", buffer[i]);
+    hex += byte;
+  }
+  return hex;
+}
+
+std::string ListTables(const std::wstring& path) {
+  sqlite3* db = nullptr;
+  const std::string uri = EncodeUriPath(path);
+  if (sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr) !=
+      SQLITE_OK) {
+    if (db) sqlite3_close(db);
+    return std::string("cannot list");
+  }
+  sqlite3_stmt* st = nullptr;
+  std::string tables;
+  if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+                         -1, &st, nullptr) == SQLITE_OK) {
+    while (sqlite3_step(st) == SQLITE_ROW) {
+      const unsigned char* name = sqlite3_column_text(st, 0);
+      if (!name) continue;
+      if (!tables.empty()) tables += ", ";
+      tables += reinterpret_cast<const char*>(name);
+    }
+  }
+  if (st) sqlite3_finalize(st);
+  sqlite3_close(db);
+  return tables.empty() ? std::string("none") : tables;
+}
+
 std::string BuildDebugReport(const std::wstring& arcName,
                              const std::vector<OpenAttempt>& attempts,
                              int bookmarkRows, const std::string& error) {
@@ -878,6 +934,7 @@ std::string BuildDebugReport(const std::wstring& arcName,
   out += "Plugin build           : x86\r\n";
 #endif
   out += "sizeof(tHeaderDataExW) : " + std::to_string(sizeof(tHeaderDataExW)) + "\r\n";
+  out += "plugin build           : " __DATE__ " " __TIME__ "\r\n";
   out += "sqlite version         : " + std::string(sqlite3_libversion()) + "\r\n";
 
   WIN32_FILE_ATTRIBUTE_DATA info;
@@ -898,6 +955,8 @@ std::string BuildDebugReport(const std::wstring& arcName,
     }
   }
   out += "side files present     : " + (sides.empty() ? std::string("none") : sides) + "\r\n";
+  out += "first 16 bytes         : " + FileHeaderHex(arcName) + "\r\n";
+  out += "tables                 : " + ListTables(arcName) + "\r\n";
   out += "moz_bookmarks rows     : " + std::to_string(bookmarkRows) + "\r\n";
   if (!error.empty()) out += "Reason                 : " + error + "\r\n";
 
