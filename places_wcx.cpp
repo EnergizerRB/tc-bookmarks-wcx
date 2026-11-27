@@ -341,7 +341,8 @@ struct OpenAttempt {
   bool opened = false;
 };
 
-std::string EncodeUriPath(const std::wstring& path) {
+std::string EncodeUriPath(const std::wstring& path,
+                          const char* query = "?mode=ro&nolock=1") {
   const std::string utf8 = WideToUtf8(path);
   const bool unc = utf8.size() >= 2 && utf8[0] == '\\' && utf8[1] == '\\';
   std::string uri = unc ? "file:" : "file:///";
@@ -355,8 +356,23 @@ std::string EncodeUriPath(const std::wstring& path) {
       default: uri.push_back(c); break;
     }
   }
-  uri.append("?mode=ro&nolock=1");
+  uri.append(query);
   return uri;
+}
+
+// Opening a write-ahead log database read-only succeeds and only the first
+// read fails, because SQLite then needs write access to the -shm file.  The
+// database counts as usable only when a statement actually runs.
+bool CanReadDatabase(sqlite3* db) {
+  if (!db) return false;
+  sqlite3_stmt* st = nullptr;
+  bool ok = false;
+  if (sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master", -1, &st, nullptr) ==
+      SQLITE_OK) {
+    ok = sqlite3_step(st) == SQLITE_ROW;
+  }
+  if (st) sqlite3_finalize(st);
+  return ok;
 }
 
 // Opens the database where it lives: no copy, no locking, read-only.
@@ -371,7 +387,38 @@ sqlite3* OpenReadOnlyUri(const std::wstring& path, OpenAttempt& attempt) {
     if (db) sqlite3_close(db);
     return nullptr;
   }
+  if (!CanReadDatabase(db)) {
+    attempt.rc = sqlite3_extended_errcode(db);
+    attempt.error = sqlite3_errmsg(db);
+    sqlite3_close(db);
+    return nullptr;
+  }
   attempt.opened = true;
+  attempt.error.clear();
+  return db;
+}
+
+// immutable=1 ignores the write-ahead log and every lock: the last checkpointed
+// state is read even when the copy was taken while Firefox was writing.
+sqlite3* OpenImmutable(const std::wstring& path, OpenAttempt& attempt) {
+  attempt.target = path;
+  const std::string uri = EncodeUriPath(path, "?immutable=1");
+  sqlite3* db = nullptr;
+  attempt.rc =
+      sqlite3_open_v2(uri.c_str(), &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
+  if (attempt.rc != SQLITE_OK) {
+    attempt.error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
+    if (db) sqlite3_close(db);
+    return nullptr;
+  }
+  if (!CanReadDatabase(db)) {
+    attempt.rc = sqlite3_extended_errcode(db);
+    attempt.error = sqlite3_errmsg(db);
+    sqlite3_close(db);
+    return nullptr;
+  }
+  attempt.opened = true;
+  attempt.error.clear();
   return db;
 }
 
@@ -465,16 +512,22 @@ sqlite3* OpenCopiedDatabase(const std::wstring& src, const std::wstring& baseDir
   // Replaying a WAL needs write access to the shm file; the copy is ours alone.
   const std::string path8 = WideToUtf8(copy);
   attempt.rc = sqlite3_open_v2(path8.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr);
-  if (attempt.rc != SQLITE_OK) {
-    if (db) {
-      attempt.error = sqlite3_errmsg(db);
-      sqlite3_close(db);
-    }
-    return nullptr;
+  if (attempt.rc == SQLITE_OK) {
+    attempt.opened = true;
+    attempt.error.clear();
+    return db;
   }
-  attempt.opened = true;
-  attempt.error.clear();
-  return db;
+  if (db) {
+    attempt.error = sqlite3_errmsg(db);
+    sqlite3_close(db);
+  }
+
+  // The three copies were taken at slightly different moments, so the log may
+  // not match the file.  A copy of the main file alone, read without the log,
+  // still shows every bookmark that Firefox checkpointed.
+  const std::wstring plain = workspace.CopyIn(src, L"tc_places_plain.sqlite");
+  if (plain.empty()) return nullptr;
+  return OpenImmutable(plain, attempt);
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +971,18 @@ std::string ListTables(const std::wstring& path) {
   return tables.empty() ? std::string("none") : tables;
 }
 
+// Firefox keeps several databases in the same folder; when the wrong one is
+// opened the report can point straight at the right one.
+std::wstring SiblingPlacesDatabase(const std::wstring& path) {
+  const size_t slash = path.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return std::wstring();
+  const std::wstring candidate = path.substr(0, slash + 1) + L"places.sqlite";
+  if (_wcsicmp(candidate.c_str(), path.c_str()) == 0) return std::wstring();
+  return GetFileAttributesW(candidate.c_str()) == INVALID_FILE_ATTRIBUTES
+             ? std::wstring()
+             : candidate;
+}
+
 std::string BuildDebugReport(const std::wstring& arcName,
                              const std::vector<OpenAttempt>& attempts,
                              int bookmarkRows, const std::string& error) {
@@ -926,6 +991,17 @@ std::string BuildDebugReport(const std::wstring& arcName,
   std::string out = "\xEF\xBB\xBF";
   out += "places_wcx could not read any bookmark from this database.\r\n";
   out += "===========================================================\r\n\r\n";
+  if (error.find("no such table: moz_bookmarks") != std::string::npos) {
+    out += "This is not a places database: it has no moz_bookmarks table.\r\n";
+    const std::wstring sibling = SiblingPlacesDatabase(arcName);
+    if (!sibling.empty()) {
+      out += "The places database in the same folder is:\r\n  " +
+             WideToUtf8(sibling) + "\r\n";
+    } else {
+      out += "Open places.sqlite from the Firefox profile folder instead.\r\n";
+    }
+    out += "\r\n";
+  }
   out += "Archive name (as passed by Total Commander):\r\n  " + WideToUtf8(arcName) +
          "\r\n\r\n";
 #if defined(_WIN64)
