@@ -39,6 +39,12 @@
 #define PK_OM_LIST 0
 #define PK_OM_EXTRACT 1
 
+#if defined(_WIN64)
+#define PLACES_WCX_ARCH "x64"
+#else
+#define PLACES_WCX_ARCH "x86"
+#endif
+
 #define PK_CAPS_MODIFY 2
 #define PK_CAPS_MULTIPLE 4
 #define PK_CAPS_DELETE 8
@@ -1101,7 +1107,8 @@ HANDLE OpenArchivePath(const std::wstring& src, int mode, int* result) {
     return nullptr;
   }
 
-  AppendLog("OpenArchiveW '" + WideToUtf8(src) + "' mode=" + std::to_string(mode));
+  AppendLog("OpenArchiveW '" + WideToUtf8(src) + "' mode=" + std::to_string(mode) +
+            " build=" __DATE__ " " __TIME__ " arch=" PLACES_WCX_ARCH);
   std::vector<OpenAttempt> attempts;
   std::vector<Entry> entries;
   int bookmarkRows = 0;
@@ -1814,7 +1821,9 @@ std::wstring StripPrefix(const std::wstring& path, const std::wstring& prefix) {
 // has been told about the capabilities: an already installed plugin has to be
 // removed and added again, otherwise the old mask stays in effect.
 WCX_EXPORT int __stdcall GetPackerCaps(void) {
-  return PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
+  const int caps = PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
+  AppendLog("GetPackerCaps -> " + std::to_string(caps) + " build=" __DATE__ " " __TIME__);
+  return caps;
 }
 
 WCX_EXPORT int __stdcall PackFilesW(LPWSTR PackedFile, LPWSTR SubPath, LPWSTR SrcPath,
