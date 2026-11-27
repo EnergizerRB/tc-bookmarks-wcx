@@ -39,6 +39,9 @@
 #define PK_OM_LIST 0
 #define PK_OM_EXTRACT 1
 
+#define PK_CAPS_MODIFY 2
+#define PK_CAPS_MULTIPLE 4
+#define PK_CAPS_DELETE 8
 #define PK_CAPS_BY_CONTENT 64
 
 #define E_SUCCESS 0
@@ -538,6 +541,7 @@ struct Entry {
   std::wstring path;    // relative path inside the archive, backslash separated
   std::string content;  // .url payload
   DWORD dosTime = 0;
+  sqlite3_int64 nodeId = 0;  // row in moz_bookmarks, used by delete and rename
 };
 
 struct ArchiveHandle {
@@ -575,6 +579,7 @@ Entry MakeBookmarkEntry(const Node& node, const std::wstring& name,
   Entry file;
   file.path = parentPath + name;
   file.dosTime = node.dosTime;
+  file.nodeId = node.id;
   file.content = "[InternetShortcut]\r\nURL=" + WideToUtf8(node.url) + "\r\n";
   return file;
 }
@@ -582,7 +587,8 @@ Entry MakeBookmarkEntry(const Node& node, const std::wstring& name,
 void EmitTree(const std::map<sqlite3_int64, Node>& nodes,
               const std::map<sqlite3_int64, std::vector<sqlite3_int64> >& children,
               sqlite3_int64 parentId, const std::wstring& parentPath,
-              std::vector<Entry>& out, int depth) {
+              std::vector<Entry>& out, int depth,
+              std::map<std::wstring, sqlite3_int64>* folderIds) {
   if (depth > 64) return;
   std::map<sqlite3_int64, std::vector<sqlite3_int64> >::const_iterator it =
       children.find(parentId);
@@ -598,7 +604,9 @@ void EmitTree(const std::map<sqlite3_int64, Node>& nodes,
                            // every bookmark carries the folder name
       std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
       std::wstring name = UniqueName(base, L"", used);
-      EmitTree(nodes, children, childId, parentPath + name + L"\\", out, depth + 1);
+      if (folderIds) (*folderIds)[ToLower(parentPath + name)] = childId;
+      EmitTree(nodes, children, childId, parentPath + name + L"\\", out, depth + 1,
+               folderIds);
     } else if (node.type == 1) {  // bookmark
       if (node.url.empty()) continue;
       if (StartsWithNoCase(node.url, L"place:")) continue;
@@ -654,7 +662,8 @@ int CountRows(sqlite3* db, const char* sql) {
 }
 
 bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
-                  std::string& error, bool* readError) {
+                  std::string& error, bool* readError,
+                  std::map<std::wstring, sqlite3_int64>* folderIds = nullptr) {
   if (readError) *readError = false;
   static const char* kSqlWithOrder =
       "SELECT b.id, b.parent, b.type, b.title, p.url, b.dateAdded "
@@ -709,7 +718,9 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
   for (const RootFolder& root : kRootFolders) {
     std::map<std::string, sqlite3_int64>::const_iterator it = rootIds.find(root.guid);
     if (it == rootIds.end()) continue;
-    EmitTree(nodes, children, it->second, std::wstring(root.name) + L"\\", out, 0);
+    if (folderIds) (*folderIds)[ToLower(root.name)] = it->second;
+    EmitTree(nodes, children, it->second, std::wstring(root.name) + L"\\", out, 0,
+             folderIds);
   }
 
   if (out.empty()) {
@@ -720,7 +731,8 @@ bool BuildEntries(sqlite3* db, std::vector<Entry>& out, int* bookmarkRows,
       const Node& node = it->second;
       if (node.type != 2 || node.parent != 1) continue;
       std::wstring base = SanitizeName(node.title.empty() ? L"Folder" : node.title);
-      EmitTree(nodes, children, it->first, base + L"\\", out, 0);
+      if (folderIds) (*folderIds)[ToLower(base)] = it->first;
+      EmitTree(nodes, children, it->first, base + L"\\", out, 0, folderIds);
     }
   }
 
@@ -909,6 +921,22 @@ WCX_EXPORT int __stdcall ProcessFile(HANDLE hArcData, int Operation,
   (void)Operation;
   (void)DestPath;
   (void)DestName;
+  return E_NOT_SUPPORTED;
+}
+
+WCX_EXPORT int __stdcall PackFiles(LPSTR PackedFile, LPSTR SubPath, LPSTR SrcPath,
+                                  LPSTR AddList, int Flags) {
+  (void)PackedFile;
+  (void)SubPath;
+  (void)SrcPath;
+  (void)AddList;
+  (void)Flags;
+  return E_NOT_SUPPORTED;
+}
+
+WCX_EXPORT int __stdcall DeleteFiles(LPSTR PackedFile, LPSTR DeleteList) {
+  (void)PackedFile;
+  (void)DeleteList;
   return E_NOT_SUPPORTED;
 }
 
@@ -1272,7 +1300,767 @@ WCX_EXPORT void __stdcall SetProcessDataProcW(HANDLE hArcData,
   if (handle) handle->processData = pProcessDataProcW;
 }
 
-WCX_EXPORT int __stdcall GetPackerCaps(void) { return PK_CAPS_BY_CONTENT; }
+// ---------------------------------------------------------------------------
+// Writing back into the profile database
+// ---------------------------------------------------------------------------
+
+// Total Commander edits a plugin archive through PackFilesW and DeleteFilesW
+// alone: a new folder arrives as a pack call that names the folder, and a
+// rename arrives as unpack, delete and pack under the new name.
+
+std::wstring DirectoryOf(const std::wstring& path) {
+  const size_t slash = path.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash + 1);
+}
+
+std::vector<std::wstring> SplitArchivePath(const std::wstring& path) {
+  std::vector<std::wstring> parts;
+  std::wstring current;
+  for (size_t i = 0; i < path.size(); ++i) {
+    const wchar_t ch = path[i];
+    if (ch == L'\\' || ch == L'/') {
+      if (!current.empty()) {
+        parts.push_back(current);
+        current.clear();
+      }
+    } else {
+      current.push_back(ch);
+    }
+  }
+  if (!current.empty()) parts.push_back(current);
+  return parts;
+}
+
+// Firefox keeps the profile open for as long as it runs.  Writing behind its
+// back would desynchronise the bookmark tree it holds in memory, so the
+// database is left untouched while the lock file is there.
+bool FirefoxHoldsProfile(const std::wstring& dbPath) {
+  const std::wstring dir = DirectoryOf(dbPath);
+  if (dir.empty()) return false;
+  return GetFileAttributesW((dir + L"parent.lock").c_str()) != INVALID_FILE_ATTRIBUTES ||
+         GetFileAttributesW((dir + L"lock").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+void ReportWriteProblem(const std::wstring& text) {
+  AppendLog("write refused: " + WideToUtf8(text));
+  MessageBoxW(nullptr, text.c_str(), L"places_wcx",
+              MB_ICONWARNING | MB_OK | MB_SETFOREGROUND);
+}
+
+sqlite3_int64 NowPrTime() {
+  FILETIME fileTime;
+  GetSystemTimeAsFileTime(&fileTime);
+  ULARGE_INTEGER value;
+  value.LowPart = fileTime.dwLowDateTime;
+  value.HighPart = fileTime.dwHighDateTime;
+  return static_cast<sqlite3_int64>(value.QuadPart / 10ULL - 11644473600000000ULL);
+}
+
+std::string NewGuid() {
+  static const char kAlphabet[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  static bool seeded = false;
+  if (!seeded) {
+    srand(static_cast<unsigned>(GetTickCount()));
+    seeded = true;
+  }
+  std::string guid(12, 'A');
+  for (size_t i = 0; i < guid.size(); ++i) guid[i] = kAlphabet[rand() % 64];
+  return guid;
+}
+
+bool TableExists(sqlite3* db, const char* table) {
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db,
+                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                         -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    return false;
+  }
+  sqlite3_bind_text(st, 1, table, -1, SQLITE_TRANSIENT);
+  const bool found = sqlite3_step(st) == SQLITE_ROW;
+  sqlite3_finalize(st);
+  return found;
+}
+
+bool HasColumn(sqlite3* db, const char* table, const char* column) {
+  const std::string sql = std::string("PRAGMA table_info(") + table + ")";
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    return false;
+  }
+  bool found = false;
+  while (sqlite3_step(st) == SQLITE_ROW) {
+    const unsigned char* name = sqlite3_column_text(st, 1);
+    if (name && _stricmp(reinterpret_cast<const char*>(name), column) == 0) {
+      found = true;
+      break;
+    }
+  }
+  sqlite3_finalize(st);
+  return found;
+}
+
+sqlite3* OpenForWrite(const std::wstring& path, std::string& error) {
+  sqlite3* db = nullptr;
+  const std::string utf8 = WideToUtf8(path);
+  const int rc = sqlite3_open_v2(utf8.c_str(), &db, SQLITE_OPEN_READWRITE, nullptr);
+  if (rc != SQLITE_OK) {
+    error = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
+    if (db) sqlite3_close(db);
+    return nullptr;
+  }
+  sqlite3_busy_timeout(db, 5000);
+  if (!CanReadDatabase(db)) {
+    error = sqlite3_errmsg(db);
+    sqlite3_close(db);
+    return nullptr;
+  }
+  return db;
+}
+
+// Bookmarks are user data; one copy per write operation is cheap insurance
+// against a mistake in this file.
+std::wstring BackupBeforeWrite(const std::wstring& dbPath) {
+  WIN32_FILE_ATTRIBUTE_DATA attributes;
+  if (!GetFileAttributesExW(dbPath.c_str(), GetFileExInfoStandard, &attributes)) {
+    return std::wstring();
+  }
+  const ULONGLONG size =
+      (static_cast<ULONGLONG>(attributes.nFileSizeHigh) << 32) | attributes.nFileSizeLow;
+  if (size > 64ULL * 1024 * 1024) return std::wstring();
+
+  SYSTEMTIME now;
+  GetLocalTime(&now);
+  wchar_t name[80];
+  _snwprintf_s(name, sizeof(name) / sizeof(name[0]), _TRUNCATE,
+               L"places_wcx_backup_%04d%02d%02d_%02d%02d%02d.sqlite", now.wYear,
+               now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond);
+  const std::wstring target = TempDirectory() + name;
+  return CopyFileW(dbPath.c_str(), target.c_str(), FALSE) ? target : std::wstring();
+}
+
+bool ExecSql(sqlite3* db, const char* sql, std::string& error) {
+  char* message = nullptr;
+  if (sqlite3_exec(db, sql, nullptr, nullptr, &message) != SQLITE_OK) {
+    error = message ? message : "sqlite error";
+    if (message) sqlite3_free(message);
+    return false;
+  }
+  return true;
+}
+
+sqlite3_int64 InsertFolder(sqlite3* db, sqlite3_int64 parent, const std::wstring& title,
+                           std::string& error) {
+  static const char* kSql =
+      "INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded,"
+      " lastModified, guid) VALUES (2, NULL, ?1,"
+      " (SELECT IFNULL(MAX(position), 0) + 1 FROM moz_bookmarks WHERE parent = ?1),"
+      " ?2, ?3, ?3, ?4)";
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, kSql, -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  const std::string title8 = WideToUtf8(title);
+  const std::string guid = NewGuid();
+  const sqlite3_int64 now = NowPrTime();
+  sqlite3_bind_int64(st, 1, parent);
+  sqlite3_bind_text(st, 2, title8.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 3, now);
+  sqlite3_bind_text(st, 4, guid.c_str(), -1, SQLITE_TRANSIENT);
+  const int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) {
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  return sqlite3_last_insert_rowid(db);
+}
+
+std::wstring ReversedHost(const std::wstring& url) {
+  size_t start = 0;
+  const size_t scheme = url.find(L"://");
+  if (scheme != std::wstring::npos) start = scheme + 3;
+  size_t end = url.find_first_of(L"/?#", start);
+  if (end == std::wstring::npos) end = url.size();
+  std::wstring host = url.substr(start, end - start);
+  const size_t at = host.find(L'@');
+  if (at != std::wstring::npos) host = host.substr(at + 1);
+  const size_t colon = host.find(L':');
+  if (colon != std::wstring::npos) host.resize(colon);
+  host = ToLower(host);
+  return std::wstring(host.rbegin(), host.rend()) + L".";
+}
+
+sqlite3_int64 EnsurePlace(sqlite3* db, const std::wstring& url,
+                          const std::wstring& title, std::string& error) {
+  const std::string url8 = WideToUtf8(url);
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, "SELECT id FROM moz_places WHERE url = ?1 LIMIT 1", -1, &st,
+                         nullptr) == SQLITE_OK) {
+    sqlite3_bind_text(st, 1, url8.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_int64 id = 0;
+    if (sqlite3_step(st) == SQLITE_ROW) id = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    if (id) return id;
+  } else if (st) {
+    sqlite3_finalize(st);
+  }
+
+  const bool hasGuid = HasColumn(db, "moz_places", "guid");
+  std::string sql =
+      "INSERT INTO moz_places (url, title, rev_host, visit_count, hidden, typed,"
+      " frecency";
+  if (hasGuid) sql += ", guid";
+  sql += ") VALUES (?1, ?2, ?3, 0, 0, 0, -1";
+  if (hasGuid) sql += ", ?4";
+  sql += ")";
+
+  const std::string title8 = WideToUtf8(title);
+  const std::string host8 = WideToUtf8(ReversedHost(url));
+  const std::string guid = NewGuid();
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  sqlite3_bind_text(st, 1, url8.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 2, title8.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(st, 3, host8.c_str(), -1, SQLITE_TRANSIENT);
+  if (hasGuid) sqlite3_bind_text(st, 4, guid.c_str(), -1, SQLITE_TRANSIENT);
+  const int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) {
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  return sqlite3_last_insert_rowid(db);
+}
+
+sqlite3_int64 InsertBookmark(sqlite3* db, sqlite3_int64 parent,
+                             const std::wstring& title, const std::wstring& url,
+                             std::string& error) {
+  const sqlite3_int64 place = EnsurePlace(db, url, title, error);
+  if (!place) return 0;
+
+  static const char* kSql =
+      "INSERT INTO moz_bookmarks (type, fk, parent, position, title, dateAdded,"
+      " lastModified, guid) VALUES (1, ?1, ?2,"
+      " (SELECT IFNULL(MAX(position), 0) + 1 FROM moz_bookmarks WHERE parent = ?2),"
+      " ?3, ?4, ?4, ?5)";
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, kSql, -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  const std::string title8 = WideToUtf8(title);
+  const std::string guid = NewGuid();
+  const sqlite3_int64 now = NowPrTime();
+  sqlite3_bind_int64(st, 1, place);
+  sqlite3_bind_int64(st, 2, parent);
+  sqlite3_bind_text(st, 3, title8.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_int64(st, 4, now);
+  sqlite3_bind_text(st, 5, guid.c_str(), -1, SQLITE_TRANSIENT);
+  const int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) {
+    error = sqlite3_errmsg(db);
+    return 0;
+  }
+  return sqlite3_last_insert_rowid(db);
+}
+
+// Editing a bookmark in the archive re-packs the same name, so an existing row
+// is re-pointed at the new URL instead of gaining a twin.
+bool UpdateBookmarkUrl(sqlite3* db, sqlite3_int64 id, const std::wstring& title,
+                       const std::wstring& url, std::string& error) {
+  const sqlite3_int64 place = EnsurePlace(db, url, title, error);
+  if (!place) return false;
+
+  const bool hasLastModified = HasColumn(db, "moz_bookmarks", "lastModified");
+  const std::string sql =
+      hasLastModified ? "UPDATE moz_bookmarks SET fk = ?1, lastModified = ?2 WHERE id = ?3"
+                      : "UPDATE moz_bookmarks SET fk = ?1 WHERE id = ?2";
+  sqlite3_stmt* st = nullptr;
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    error = sqlite3_errmsg(db);
+    return false;
+  }
+  sqlite3_bind_int64(st, 1, place);
+  if (hasLastModified) {
+    sqlite3_bind_int64(st, 2, NowPrTime());
+    sqlite3_bind_int64(st, 3, id);
+  } else {
+    sqlite3_bind_int64(st, 2, id);
+  }
+  const int rc = sqlite3_step(st);
+  sqlite3_finalize(st);
+  if (rc != SQLITE_DONE) {
+    error = sqlite3_errmsg(db);
+    return false;
+  }
+  return true;
+}
+
+// A folder is deleted together with everything below it, and every removed guid
+// is recorded so that Firefox sync does not resurrect it.
+bool DeleteNode(sqlite3* db, sqlite3_int64 id, std::string& error) {
+  std::vector<sqlite3_int64> ids;
+  sqlite3_stmt* st = nullptr;
+  static const char* kSql =
+      "WITH RECURSIVE sub(id) AS (SELECT ?1 UNION ALL "
+      "SELECT b.id FROM moz_bookmarks b JOIN sub s ON b.parent = s.id) "
+      "SELECT id FROM sub";
+  if (sqlite3_prepare_v2(db, kSql, -1, &st, nullptr) != SQLITE_OK) {
+    if (st) sqlite3_finalize(st);
+    error = sqlite3_errmsg(db);
+    return false;
+  }
+  sqlite3_bind_int64(st, 1, id);
+  while (sqlite3_step(st) == SQLITE_ROW) ids.push_back(sqlite3_column_int64(st, 0));
+  sqlite3_finalize(st);
+  if (ids.empty()) {
+    error = "no such bookmark";
+    return false;
+  }
+
+  if (TableExists(db, "moz_bookmarks_deleted")) {
+    for (size_t i = 0; i < ids.size(); ++i) {
+      sqlite3_stmt* guid = nullptr;
+      if (sqlite3_prepare_v2(db, "SELECT guid FROM moz_bookmarks WHERE id = ?1", -1, &guid,
+                             nullptr) != SQLITE_OK) {
+        if (guid) sqlite3_finalize(guid);
+        continue;
+      }
+      sqlite3_bind_int64(guid, 1, ids[i]);
+      std::string value;
+      if (sqlite3_step(guid) == SQLITE_ROW) {
+        const unsigned char* text = sqlite3_column_text(guid, 0);
+        if (text) value = reinterpret_cast<const char*>(text);
+      }
+      sqlite3_finalize(guid);
+      if (value.empty()) continue;
+
+      sqlite3_stmt* tomb = nullptr;
+      if (sqlite3_prepare_v2(db,
+                             "INSERT OR REPLACE INTO moz_bookmarks_deleted (guid,"
+                             " dateRemoved) VALUES (?1, ?2)",
+                             -1, &tomb, nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(tomb, 1, value.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(tomb, 2, NowPrTime());
+        sqlite3_step(tomb);
+      }
+      if (tomb) sqlite3_finalize(tomb);
+    }
+  }
+
+  for (size_t i = ids.size(); i-- > 0;) {
+    sqlite3_stmt* del = nullptr;
+    if (sqlite3_prepare_v2(db, "DELETE FROM moz_bookmarks WHERE id = ?1", -1, &del,
+                           nullptr) != SQLITE_OK) {
+      if (del) sqlite3_finalize(del);
+      error = sqlite3_errmsg(db);
+      return false;
+    }
+    sqlite3_bind_int64(del, 1, ids[i]);
+    const int rc = sqlite3_step(del);
+    sqlite3_finalize(del);
+    if (rc != SQLITE_DONE) {
+      error = sqlite3_errmsg(db);
+      return false;
+    }
+  }
+  return true;
+}
+
+// Walks the archive path and creates the folders that are missing.  New folders
+// are added to the map so that the rest of the same call sees them.
+sqlite3_int64 EnsureFolder(sqlite3* db,
+                           std::map<std::wstring, sqlite3_int64>& folders,
+                           const std::vector<std::wstring>& parts, std::string& error) {
+  std::wstring path;
+  sqlite3_int64 current = 0;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (i) path += L'\\';
+    path += parts[i];
+    const std::wstring key = ToLower(path);
+    std::map<std::wstring, sqlite3_int64>::const_iterator it = folders.find(key);
+    if (it != folders.end()) {
+      current = it->second;
+      continue;
+    }
+    const std::wstring name = SanitizeName(parts[i]);
+    current = InsertFolder(db, current, name.empty() ? L"Folder" : name, error);
+    if (!current) return 0;
+    folders[key] = current;
+  }
+  return current;
+}
+
+bool ReadUrlFromFile(const std::wstring& path, std::wstring* url) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  std::string data(65536, '\0');
+  DWORD read = 0;
+  const BOOL ok = ReadFile(file, &data[0], static_cast<DWORD>(data.size()), &read, nullptr);
+  CloseHandle(file);
+  if (!ok || read == 0) return false;
+  data.resize(read);
+
+  std::wstring text;
+  if (read >= 2 && static_cast<unsigned char>(data[0]) == 0xFF &&
+      static_cast<unsigned char>(data[1]) == 0xFE) {
+    text.assign(reinterpret_cast<const wchar_t*>(data.data() + 2), (read - 2) / 2);
+  } else if (read >= 3 && static_cast<unsigned char>(data[0]) == 0xEF &&
+             static_cast<unsigned char>(data[1]) == 0xBB) {
+    text = Utf8ToWide(data.c_str() + 3, static_cast<int>(read) - 3);
+  } else {
+    text = Utf8ToWide(data.c_str(), static_cast<int>(read));
+  }
+
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find_first_of(L"\r\n", pos);
+    if (end == std::wstring::npos) end = text.size();
+    const std::wstring line = text.substr(pos, end - pos);
+    if (StartsWithNoCase(line, L"URL=")) {
+      std::wstring value = line.substr(4);
+      while (!value.empty() && (value.front() == L' ' || value.front() == L'\t')) {
+        value.erase(value.begin());
+      }
+      while (!value.empty() && (value.back() == L' ' || value.back() == L'\t')) {
+        value.pop_back();
+      }
+      if (!value.empty()) {
+        *url = value;
+        return true;
+      }
+    }
+    pos = end + 1;
+  }
+  return false;
+}
+
+std::wstring FileUrlFor(const std::wstring& path) {
+  std::wstring url = L"file:///";
+  for (size_t i = 0; i < path.size(); ++i) url.push_back(path[i] == L'\\' ? L'/' : path[i]);
+  return url;
+}
+
+bool AddBookmarkFromFile(sqlite3* db, sqlite3_int64 parent, const std::wstring& diskPath,
+                         const std::wstring& fileName, std::string& error) {
+  if (GetFileAttributesW(diskPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    AppendLog("  source not found: '" + WideToUtf8(diskPath) + "'");
+    return true;
+  }
+  std::wstring url;
+  if (!ReadUrlFromFile(diskPath, &url)) url = FileUrlFor(diskPath);
+  if (url.empty()) return true;
+
+  std::wstring title = fileName;
+  if (EndsWithNoCase(title, L".url")) title.resize(title.size() - 4);
+  title = SanitizeName(title);
+  if (title.empty()) title = L"Bookmark";
+  return InsertBookmark(db, parent, title, url, error) != 0;
+}
+
+bool PackOne(sqlite3* db, sqlite3_int64 parent, const std::wstring& diskPath,
+             const std::wstring& itemName, std::string& error, int depth) {
+  if (depth > 32) return true;
+  const DWORD attributes = GetFileAttributesW(diskPath.c_str());
+  if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+    const std::wstring name = SanitizeName(itemName);
+    const sqlite3_int64 folder =
+        InsertFolder(db, parent, name.empty() ? L"Folder" : name, error);
+    if (!folder) return false;
+
+    WIN32_FIND_DATAW data;
+    HANDLE find = FindFirstFileW((diskPath + L"\\*").c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return true;
+    bool ok = true;
+    do {
+      if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+        continue;
+      }
+      if (!PackOne(db, folder, diskPath + L"\\" + data.cFileName, data.cFileName, error,
+                   depth + 1)) {
+        ok = false;
+        break;
+      }
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return ok;
+  }
+  return AddBookmarkFromFile(db, parent, diskPath, itemName, error);
+}
+
+std::wstring StripPrefix(const std::wstring& path, const std::wstring& prefix) {
+  if (prefix.empty() || path.size() <= prefix.size()) return path;
+  if (_wcsnicmp(path.c_str(), prefix.c_str(), prefix.size()) != 0) return path;
+  size_t skip = prefix.size();
+  while (skip < path.size() && (path[skip] == L'\\' || path[skip] == L'/')) ++skip;
+  return path.substr(skip);
+}
+
+
+// Total Commander only offers packing, folder creation and deletion after it
+// has been told about the capabilities: an already installed plugin has to be
+// removed and added again, otherwise the old mask stays in effect.
+WCX_EXPORT int __stdcall GetPackerCaps(void) {
+  return PK_CAPS_MODIFY | PK_CAPS_MULTIPLE | PK_CAPS_DELETE | PK_CAPS_BY_CONTENT;
+}
+
+WCX_EXPORT int __stdcall PackFilesW(LPWSTR PackedFile, LPWSTR SubPath, LPWSTR SrcPath,
+                                    LPWSTR AddList, int Flags) {
+  const std::wstring archive = PackedFile ? PackedFile : L"";
+  AppendLog("PackFilesW pack='" + WideToUtf8(archive) + "' sub='" +
+            (SubPath ? WideToUtf8(SubPath) : std::string("<null>")) + "' src='" +
+            (SrcPath ? WideToUtf8(SrcPath) : std::string("<null>")) + "' flags=" +
+            std::to_string(Flags));
+  for (const WCHAR* item = AddList; item && *item; item += wcslen(item) + 1) {
+    AppendLog("  add '" + WideToUtf8(item) + "'");
+  }
+  if (archive.empty()) return E_ECREATE;
+
+  if (FirefoxHoldsProfile(archive)) {
+    ReportWriteProblem(
+        L"Firefox запущен и держит базу закладок открытой.\r\n"
+        L"Закройте Firefox и повторите операцию.");
+    return E_NOT_SUPPORTED;
+  }
+
+  const std::wstring backup = BackupBeforeWrite(archive);
+  if (!backup.empty()) AppendLog("  backup '" + WideToUtf8(backup) + "'");
+
+  std::string error;
+  sqlite3* db = OpenForWrite(archive, error);
+  if (!db) {
+    ReportWriteProblem(L"Не удалось открыть базу закладок для записи:\r\n" +
+                       Utf8ToWide(error.c_str(), static_cast<int>(error.size())));
+    return E_ECREATE;
+  }
+
+  std::vector<Entry> entries;
+  std::map<std::wstring, sqlite3_int64> folders;
+  int rows = 0;
+  bool readError = false;
+  BuildEntries(db, entries, &rows, error, &readError, &folders);
+
+  std::map<std::wstring, sqlite3_int64> files;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    files[ToLower(entries[i].path)] = entries[i].nodeId;
+  }
+
+  const std::wstring sourceDir = SrcPath ? SrcPath : L"";
+  const std::vector<std::wstring> subParts = SplitArchivePath(SubPath ? SubPath : L"");
+
+  if (!ExecSql(db, "BEGIN IMMEDIATE", error)) {
+    AppendLog("  cannot start a transaction: " + error);
+    sqlite3_close(db);
+    return E_EWRITE;
+  }
+
+  sqlite3_int64 parent = 0;
+  if (!subParts.empty()) {
+    parent = EnsureFolder(db, folders, subParts, error);
+  } else {
+    // Packing at the archive root: the entry has to land in a real folder to
+    // stay visible, so it goes to the unfiled bookmarks.
+    std::map<std::wstring, sqlite3_int64>::const_iterator it =
+        folders.find(ToLower(std::wstring(L"Другие закладки")));
+    parent = (it != folders.end()) ? it->second : 1;
+  }
+  if (!parent) {
+    AppendLog("  cannot resolve the target folder: " + error);
+    ExecSql(db, "ROLLBACK", error);
+    sqlite3_close(db);
+    return E_ECREATE;
+  }
+
+  bool ok = true;
+  int added = 0;
+  for (const WCHAR* item = AddList; item && *item && ok; item += wcslen(item) + 1) {
+    const std::wstring raw(item);
+    const std::wstring relative = StripPrefix(raw, sourceDir);
+    const bool trailingSlash =
+        !relative.empty() && (relative.back() == L'\\' || relative.back() == L'/');
+
+    std::vector<std::wstring> parts = SplitArchivePath(relative);
+    if (parts.empty()) continue;
+    const std::wstring itemName = parts.back();
+    parts.pop_back();
+
+    std::vector<std::wstring> absolute = subParts;
+    absolute.insert(absolute.end(), parts.begin(), parts.end());
+    const sqlite3_int64 target =
+        absolute.empty() ? parent : EnsureFolder(db, folders, absolute, error);
+    if (!target) {
+      ok = false;
+      break;
+    }
+
+    std::wstring diskPath;
+    if (IsAbsolutePath(raw)) {
+      diskPath = raw;
+    } else if (!sourceDir.empty()) {
+      diskPath = sourceDir + L"\\" + relative;
+    } else {
+      diskPath = relative;
+    }
+
+    const DWORD attributes = GetFileAttributesW(diskPath.c_str());
+    const bool exists = attributes != INVALID_FILE_ATTRIBUTES;
+    const bool isDirectory = exists && (attributes & FILE_ATTRIBUTE_DIRECTORY);
+
+    std::wstring fullPath;
+    for (size_t i = 0; i < absolute.size(); ++i) {
+      fullPath += absolute[i];
+      fullPath += L'\\';
+    }
+    fullPath += itemName;
+    std::map<std::wstring, sqlite3_int64>::const_iterator known =
+        files.find(ToLower(fullPath));
+    if (known != files.end() && exists && !isDirectory && !trailingSlash) {
+      std::wstring url;
+      if (!ReadUrlFromFile(diskPath, &url)) url = FileUrlFor(diskPath);
+      std::wstring title = itemName;
+      if (EndsWithNoCase(title, L".url")) title.resize(title.size() - 4);
+      if (!url.empty() &&
+          UpdateBookmarkUrl(db, known->second, SanitizeName(title), url, error)) {
+        ++added;
+        continue;
+      }
+      ok = false;
+      break;
+    }
+
+    // A name that is not on disk cannot be packed as a file: Total Commander
+    // uses such an entry to create a folder.
+    if (trailingSlash || !exists || isDirectory) {
+      if (isDirectory) {
+        ok = PackOne(db, target, diskPath, itemName, error, 0);
+      } else {
+        // Total Commander creates a folder by packing its name alone.
+        const std::wstring name = SanitizeName(itemName);
+        const sqlite3_int64 created =
+            InsertFolder(db, target, name.empty() ? L"Folder" : name, error);
+        if (!created) {
+          ok = false;
+          break;
+        }
+        absolute.push_back(itemName);
+        std::wstring key;
+        for (size_t i = 0; i < absolute.size(); ++i) {
+          if (i) key += L'\\';
+          key += absolute[i];
+        }
+        folders[ToLower(key)] = created;
+      }
+    } else {
+      ok = PackOne(db, target, diskPath, itemName, error, 0);
+    }
+    if (ok) ++added;
+  }
+
+  if (!ok || !ExecSql(db, "COMMIT", error)) {
+    AppendLog("  pack failed: " + error);
+    ExecSql(db, "ROLLBACK", error);
+    sqlite3_close(db);
+    return E_EWRITE;
+  }
+  sqlite3_close(db);
+  AppendLog("  packed " + std::to_string(added));
+  return E_SUCCESS;
+}
+
+WCX_EXPORT int __stdcall DeleteFilesW(LPWSTR PackedFile, LPWSTR DeleteList) {
+  const std::wstring archive = PackedFile ? PackedFile : L"";
+  AppendLog("DeleteFilesW pack='" + WideToUtf8(archive) + "'");
+  for (const WCHAR* item = DeleteList; item && *item; item += wcslen(item) + 1) {
+    AppendLog("  del '" + WideToUtf8(item) + "'");
+  }
+  if (archive.empty() || !DeleteList) return E_BAD_ARCHIVE;
+
+  if (FirefoxHoldsProfile(archive)) {
+    ReportWriteProblem(
+        L"Firefox запущен и держит базу закладок открытой.\r\n"
+        L"Закройте Firefox и повторите операцию.");
+    return E_NOT_SUPPORTED;
+  }
+
+  const std::wstring backup = BackupBeforeWrite(archive);
+  if (!backup.empty()) AppendLog("  backup '" + WideToUtf8(backup) + "'");
+
+  std::string error;
+  sqlite3* db = OpenForWrite(archive, error);
+  if (!db) {
+    ReportWriteProblem(L"Не удалось открыть базу закладок для записи:\r\n" +
+                       Utf8ToWide(error.c_str(), static_cast<int>(error.size())));
+    return E_ECREATE;
+  }
+
+  std::vector<Entry> entries;
+  std::map<std::wstring, sqlite3_int64> folders;
+  int rows = 0;
+  bool readError = false;
+  BuildEntries(db, entries, &rows, error, &readError, &folders);
+
+  std::map<std::wstring, sqlite3_int64> files;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    files[ToLower(entries[i].path)] = entries[i].nodeId;
+  }
+
+  if (!ExecSql(db, "BEGIN IMMEDIATE", error)) {
+    AppendLog("  cannot start a transaction: " + error);
+    sqlite3_close(db);
+    return E_EWRITE;
+  }
+
+  int deleted = 0;
+  int requested = 0;
+  for (const WCHAR* item = DeleteList; *item; item += wcslen(item) + 1) {
+    std::wstring key = ToLower(item);
+    while (!key.empty() && (key.back() == L'\\' || key.back() == L'/')) key.pop_back();
+    if (key.empty()) continue;
+    ++requested;
+
+    sqlite3_int64 id = 0;
+    std::map<std::wstring, sqlite3_int64>::const_iterator fit = files.find(key);
+    if (fit != files.end()) {
+      id = fit->second;
+    } else {
+      std::map<std::wstring, sqlite3_int64>::const_iterator dit = folders.find(key);
+      if (dit != folders.end()) id = dit->second;
+    }
+    if (!id) {
+      AppendLog("  not in the archive: '" + WideToUtf8(key) + "'");
+      continue;
+    }
+    std::string why;
+    if (DeleteNode(db, id, why)) {
+      ++deleted;
+    } else {
+      AppendLog("  delete failed '" + WideToUtf8(key) + "': " + why);
+    }
+  }
+
+  if (!ExecSql(db, "COMMIT", error)) {
+    AppendLog("  commit failed: " + error);
+    ExecSql(db, "ROLLBACK", error);
+    sqlite3_close(db);
+    return E_EWRITE;
+  }
+  sqlite3_close(db);
+  AppendLog("  deleted " + std::to_string(deleted) + " of " + std::to_string(requested));
+  return (deleted > 0 || requested == 0) ? E_SUCCESS : E_BAD_ARCHIVE;
+}
 
 WCX_EXPORT BOOL __stdcall CanYouHandleThisFileW(LPWSTR FileName) {
   if (!FileName || !*FileName) return FALSE;

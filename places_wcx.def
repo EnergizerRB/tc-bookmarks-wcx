@@ -12,6 +12,10 @@ EXPORTS
     ReadHeaderExW
     ProcessFile
     ProcessFileW
+    PackFiles
+    PackFilesW
+    DeleteFiles
+    DeleteFilesW
     CloseArchive
     GetPackerCaps
     CanYouHandleThisFile
